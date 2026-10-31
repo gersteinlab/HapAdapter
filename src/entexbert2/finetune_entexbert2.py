@@ -459,9 +459,16 @@ def train():
         tokenizer.eos_token = tokenizer.pad_token
 
     # NEW: resolve the classification head variant before datasets/model are built ############
-    if model_args.head_variant not in ("auto", "twin", "single"):
-        raise ValueError(f"--head_variant must be 'auto', 'twin' or 'single', got {model_args.head_variant!r}.")
+    if model_args.head_variant not in ("auto", "twin", "single", "signed_pair"):
+        raise ValueError(f"--head_variant must be 'auto', 'twin', 'single' or 'signed_pair', "
+                         f"got {model_args.head_variant!r}.")
     if model_args.head_variant == "auto":
+        if data_args.task == "regression" and data_args.input_mode == "hap_pair":
+            raise ValueError(
+                "--task regression --input_mode hap_pair is ambiguous under --head_variant auto: "
+                "it resolves to 'twin', which for a REGRESSION task collapses to the single-window "
+                "trunk and SILENTLY IGNORES sequence2. Pass --head_variant signed_pair for the "
+                "antisymmetric contrast, or --input_mode ref_single for the plain trunk.")
         model_args.head_variant = "twin" if data_args.input_mode == "hap_pair" else "single"
         logging.warning(f"--head_variant auto -> {model_args.head_variant!r} "
                         f"(from --input_mode {data_args.input_mode})")
@@ -469,6 +476,13 @@ def train():
         raise ValueError("--head_variant twin needs --input_mode hap_pair (it scores a window PAIR)")
     if model_args.head_variant == "single" and data_args.input_mode != "ref_single":
         raise ValueError("--head_variant single needs --input_mode ref_single (it scores a SINGLE window)")
+    if model_args.head_variant == "signed_pair":
+        if data_args.input_mode != "hap_pair":
+            raise ValueError("--head_variant signed_pair needs --input_mode hap_pair "
+                             "(mu = mu(hap1) - mu(hap2) scores a window PAIR)")
+        if data_args.task != "regression":
+            raise ValueError("--head_variant signed_pair is a REGRESSION readout (signed allelic "
+                             "effect); pass --task regression")
 
     # define datasets and data collator [MODIFIED: added input_mode=data_args.input_mode for hap_pair]
     train_dataset = SupervisedDataset(tokenizer=tokenizer,

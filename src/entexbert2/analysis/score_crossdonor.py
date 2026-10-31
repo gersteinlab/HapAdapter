@@ -13,21 +13,59 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
+def _head_variant(head_dir):
+    """Read head_variant off the checkpoint"""
+    p = os.path.join(head_dir, "run_config.json")
+    if not os.path.exists(p):
+        print(f"[head] WARNING: no run_config.json in {head_dir}; assuming head_variant='twin'")
+        return "twin"
+    import json
+    return json.load(open(p)).get("head_variant", "twin")
+
 def score_on(head_dir, test_csv, batch_size, device):
+    """Score one donor's test split; returns (auroc_matched, auroc_plain, n, n_pos, n_matched)"""
     from entexbert2.model_io import run_inference # to keep --help torch-free
+    from entexbert2.eval_utils import balanced_auroc
+
     df = pd.read_csv(test_csv)
+    variant = _head_variant(head_dir)
 
-    if "sequence1" not in df.columns or "sequence2" not in df.columns or "label" not in df.columns:
-        raise ValueError(f"{test_csv}: need sequence1,sequence2,label; got {list(df.columns)[:6]}")
+    if "label" not in df.columns:
+        raise ValueError(f"{test_csv}: no label column; got {list(df.columns)[:6]}")
 
-    pairs = [[s1, s2] for s1, s2 in zip(df["sequence1"].astype(str), df["sequence2"].astype(str))]
-    logits, _emb, _rc = run_inference(head_dir, pairs, batch_size, device)
+    if variant == "twin":
+        if "sequence1" not in df.columns or "sequence2" not in df.columns:
+            raise ValueError(f"{test_csv}: head_variant='twin' needs sequence1,sequence2; "
+                             f"got {list(df.columns)[:6]} -- is this a ref_single build?")
+        texts = [[s1, s2] for s1, s2 in zip(df["sequence1"].astype(str), df["sequence2"].astype(str))]
+    elif variant == "single":
+        if "sequence" not in df.columns:
+            raise ValueError(f"{test_csv}: head_variant='single' needs a flat `sequence` column; "
+                             f"got {list(df.columns)[:6]} -- is this a hap_pair build?")
+        texts = df["sequence"].astype(str).tolist()
+    else:
+        raise ValueError(f"{head_dir}: unknown head_variant {variant!r} (expected twin|single)")
+
+    logits, _emb, _rc = run_inference(head_dir, texts, batch_size, device)
     ell = np.asarray(logits).reshape(-1)
     y = df["label"].astype(int).to_numpy()
+    if y.min() == y.max():
+        return float("nan"), float("nan"), len(y), int(y.sum()), 0
 
-    # compute AUROC for cross-donor
-    auroc = float(roc_auc_score(y, ell)) if y.min() != y.max() else float("nan")
-    return auroc, len(y), int(y.sum())
+    plain = float(roc_auc_score(y, ell))
+    cov_col = next((c for c in ("depth", "total_reads") if c in df.columns), None)
+    if cov_col is None:
+        print(f"[cov] WARNING: {test_csv} has no depth/total_reads column -- the matched AUROC "
+              f"falls back to class-balancing only and is NOT depth-controlled")
+        cov = None
+    else:
+        cov = df[cov_col].to_numpy(float)
+        if not np.isfinite(cov).all():
+            print(f"[cov] WARNING: non-finite values in {cov_col} -- depth control disabled")
+            cov = None
+            
+    matched, _aupr, _ci, n_matched = balanced_auroc(ell, y, cover=cov)
+    return float(matched), plain, len(y), int(y.sum()), int(n_matched)
 
 def _meta_coords(path):
     """(chr, pos) set from a *.meta.csv"""
@@ -113,7 +151,7 @@ def main():
     ap.add_argument("--checkpoint_dir", required=True, help="the trained head (train_donor's arm)")
     ap.add_argument("--assay", required=True)
     ap.add_argument("--train_donor", required=True)
-    ap.add_argument("--arm", choices=["ref", "personal"], default="ref")
+    ap.add_argument("--arm", choices=["ref", "personal", "ref_single", "personal_single"], default="ref")
     ap.add_argument("--exp_root", required=True)
     ap.add_argument("--donors", nargs="+", required=True)
     ap.add_argument("--out", required=True, help="per-head output CSV (overwritten, not appended)")
@@ -139,12 +177,17 @@ def main():
         if not os.path.exists(tcsv):
             print(f"[skip] {a.assay}/{ed} {a.arm}: no test.csv at {tcsv}")
             continue
-        au, n, npos = score_on(a.checkpoint_dir, tcsv, a.batch_size, a.device)
+
+        au, au_plain, n, npos, n_match = score_on(a.checkpoint_dir, tcsv, a.batch_size, a.device)
+        
         kind = "matched" if ed == a.train_donor else "cross-donor"
         rows.append(dict(assay=a.assay, train_donor=a.train_donor, eval_donor=ed, arm=a.arm,
-                         donor_kind=kind, auroc=au, n=n, n_pos=npos))
-        print(f"  [{a.assay}] {a.train_donor} -> {ed} ({kind}) {a.arm}: "
-              f"AUROC={au:.4f} n={n} n_pos={npos}")
+                         head_variant=_head_variant(a.checkpoint_dir), donor_kind=kind,
+                         auroc_cov_matched=au, auroc_plain=au_plain,
+                         n=n, n_pos=npos, n_cov_matched=n_match))
+        print(f"  [{a.assay}] {a.train_donor} -> {ed} (donor: {kind}) {a.arm}: "
+              f"AUROC cov-matched={au:.4f} plain={au_plain:.4f} "
+              f"n={n} n_pos={npos} n_cov_matched={n_match}")
 
     if not rows:
         print("[warn] no rows produced (no test.csv found)"); return

@@ -134,7 +134,8 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         self.neff_s = float(neff_s)
         self.task = task
         self.num_labels = num_labels
-        self.head_variant = head_variant if task == "classification" else "twin"
+        self.head_variant = (head_variant if task == "classification"
+                             else ("signed_pair" if head_variant == "signed_pair" else "twin"))
 
         # Shared pretrained trunk (DNABERT-2-117M)
         self.backbone = transformers.AutoModel.from_pretrained(
@@ -193,24 +194,57 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         for p in self.backbone.parameters():
             p.requires_grad = True
 
-    def init_backbone_from(self, checkpoint_path: str, map_location="cpu") -> int:
+    def init_backbone_from(self, checkpoint_path: str, map_location="cpu", include_head: Optional[bool] = None) -> int:
         """
-        Load ONLY the `backbone.*` weights from a Stage-1 checkpoint state_dict into this fresh-head model;
-        returns the number of backbone tensors loaded
+        Load the `backbone.*` weights from a Stage-1 checkpoint state_dict into this model;
+        returns the number of tensors loaded.
+
+        include_head also restores `main_head.*`. It defaults to True only for
+        head_variant="signed_pair", whose readout mu(hap1) - mu(hap2) IS main_head(pool) applied
+        twice -- transferring the trunk's head starts that contrast at the trunk's measured allelic
+        Delta instead of at a random linear map. Every other arm trains a NEW task and keeps a fresh
+        head. Weights match BY NAME, so the head geometry must equal the checkpoint's.
         """
+        # Default by readout rather than by flag: a signed_pair model's mu IS main_head(pool), so
+        # transferring the trunk's head is the correct default there (it starts the contrast at the
+        # trunk's measured Delta). For the plain trunk / classification arms the head is a NEW task
+        # and must stay fresh, so they keep the old behaviour. No existing checkpoint is
+        # head_variant='signed_pair', so nothing already trained changes.
+        if include_head is None:
+            include_head = (self.head_variant == "signed_pair")
+
         sd = torch.load(checkpoint_path, map_location=map_location)
         if isinstance(sd, dict) and "state_dict" in sd and "backbone.embeddings" not in str(sd.keys()):
             sd = sd["state_dict"]
-        backbone_sd = {k: v for k, v in sd.items() if k.startswith("backbone.")}
-        if not backbone_sd:
+        prefixes = ("backbone.", "main_head.") if include_head else ("backbone.",)
+        backbone_sd = {k: v for k, v in sd.items() if k.startswith(prefixes)}
+        if not any(k.startswith("backbone.") for k in backbone_sd):
             raise ValueError(
                 f"No 'backbone.*' keys found in {checkpoint_path}; got prefixes "
                 f"{sorted({k.split('.')[0] for k in sd})}. Is this an entexBERT2 checkpoint?"
+            )
+        if include_head and not any(k.startswith("main_head.") for k in backbone_sd):
+            raise ValueError(
+                f"include_head=True but {checkpoint_path} has no 'main_head.*' keys; got prefixes "
+                f"{sorted({k.split('.')[0] for k in sd})}. A twin CLASSIFICATION checkpoint sets "
+                f"main_head = None and stores proj/dist_a/dist_b instead -- point at the Stage-1 "
+                f"regression trunk."
             )
         missing, unexpected = self.load_state_dict(backbone_sd, strict=False)
         # 'missing' lists the fresh head params (these are expected); 'unexpected' should be empty!
         if unexpected:
             raise ValueError(f"Unexpected keys while loading backbone: {unexpected[:5]} ...")
+        if include_head:
+            # A SHAPE mismatch does not raise under strict=False -- load_state_dict leaves the
+            # tensor at its random init and reports the key as missing. That silent path is exactly
+            # what this argument exists to prevent, so check it explicitly.
+            still = [k for k in missing if k.startswith("main_head.")]
+            if still:
+                raise ValueError(
+                    f"main_head weights did NOT load: {still[:4]}. The head geometry differs from "
+                    f"the checkpoint's -- build this model with the trunk's own head_num_layers / "
+                    f"head_hidden_size / head_activation."
+                )
         return len(backbone_sd)
 
     # ---- Pooling -----------------------------------------------------------
@@ -322,9 +356,16 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                 loss = (w * bce).mean()
             return SequenceClassifierOutput(loss=loss, logits=ell.unsqueeze(-1))
 
-        # regression: Stage-1 binding trunk (single window)
-        mu, _ = self._score_one(input_ids, attention_mask, **kwargs)
-        # (B,) or (B,T) binding score
+        # regression: Stage-1 binding trunk (single window), or a SIGNED paired contrast
+        if self.head_variant == "signed_pair":
+            if input_ids_alt is None:
+                raise ValueError("head_variant='signed_pair' requires paired inputs "
+                                 "([hap1 window, hap2 window]).")
+            mu1, _ = self._score_one(input_ids, attention_mask, **kwargs)
+            mu2, _ = self._score_one(input_ids_alt, attention_mask_alt, **kwargs)
+            mu = mu1 - mu2      # antisymmetric: swapping haplotypes flips the sign exactly
+        else:
+            mu, _ = self._score_one(input_ids, attention_mask, **kwargs) # (B,) or (B,T) binding score
 
         # multi-track Stage-1 (num_labels > 1): masked multi-output MSE
         if self.num_labels > 1:

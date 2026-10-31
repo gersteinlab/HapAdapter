@@ -1,0 +1,2 @@
+[console_scripts]
+entexbert2-build = entexbert2.build_experiment:main

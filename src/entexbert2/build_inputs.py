@@ -1339,7 +1339,7 @@ class HaplotypeCountRowSource(RowSource):
     """
     source_type = "hap_counts"
     has_variants = True
-    supported_input_modes = frozenset({"hap_pair", "ref_single"})
+    supported_input_modes = frozenset({"hap_pair", "ref_single", "hap1_single", "hap2_single"})
 
     def __init__(
         self,

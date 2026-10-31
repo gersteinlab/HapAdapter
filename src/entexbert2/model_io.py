@@ -178,6 +178,7 @@ def logits_and_embeddings(model, input_ids, attention_mask,
         return_pools=True:   (logits, pooled_contrast, pool1, pool2)   (pool2=None if single sequence)
     """
     task = getattr(model, "task", "regression")
+    variant = getattr(model, "head_variant", "twin")
 
     # Route through model._pool_one so pooling matches training exactly
     def _pool(ids, mask):
@@ -186,11 +187,13 @@ def logits_and_embeddings(model, input_ids, attention_mask,
     pool1 = _pool(input_ids, attention_mask)
     pool2 = None
 
-    if task == "classification":
+    if task == "classification" and variant == "twin":
         if input_ids_alt is None:
             raise ValueError(
-                "classification scoring requires paired inputs (hap1, hap2), but input was a single sequence"
+                "twin classification scoring requires paired inputs (hap1, hap2), but input was a "
+                "single sequence. A head_variant='single' checkpoint takes flat windows instead."
             )
+
         pool2 = _pool(input_ids_alt, attention_mask_alt)
         z1 = model.proj(pool1)
         z2 = model.proj(pool2)
@@ -203,7 +206,8 @@ def logits_and_embeddings(model, input_ids, attention_mask,
             return logits, pooled, pool1, pool2
         return logits, pooled
 
-    # regression (Stage-1 binding trunk): single-window score mu = head(pool1)
+    # single-window readout:
+    # shared by the Stage-1 regression trunk (mu) and head_variant="single" classification head (the ASB logit)
     logits = model.main_head(pool1)
     pooled = pool1
 
@@ -237,8 +241,23 @@ def run_inference(checkpoint_dir, texts, batch_size=64, device="cpu",
     is_pair = len(texts) > 0 and isinstance(texts[0], (list, tuple))
     if dump_pools and not is_pair:
         raise ValueError("dump_pools=True requires paired inputs ([window1, window2]).")
-    if getattr(model, "task", "regression") == "classification" and not is_pair:
-        raise ValueError("classification scoring requires paired inputs ([window1, window2]).")
+
+    _task = getattr(model, "task", "regression")
+    _variant = getattr(model, "head_variant", "twin")
+
+    if _task == "classification" and _variant == "twin" and not is_pair:
+        raise ValueError("twin classification scoring requires paired inputs ([window1, window2]); "
+                         "this checkpoint has head_variant='twin'")
+    if _task == "classification" and _variant == "single" and is_pair:
+        raise ValueError("head_variant='single' scores ONE window; paired inputs were given")
+    
+    if dump_pools and not (_task == "classification" and _variant == "twin"):
+        raise ValueError(
+            "dump_pools=True returns pool_ref AND pool_alt, but only the twin classification "
+            "readout pools both windows; every other variant pools window1 only and would return "
+            "pool_alt=None. To get per-window pools from a trunk or a single head, you should call "
+            "run_inference twice (once per window).")
+
     mml = run_config.get("model_max_length", 512)
 
     all_logits, all_emb, all_ref, all_alt = [], [], [], []
