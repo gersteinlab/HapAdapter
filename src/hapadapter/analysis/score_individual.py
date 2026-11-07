@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-entexbert2.analysis.score_individual -- within-individual ASB-head scoring (both arms --ref and --personal supported)
+hapadapter.analysis.score_individual -- within-individual ASB-head scoring (both arms --ref and --personal supported)
 
 NOTE: does NOT compute AUROC (within-individual AUROC read from the Trainer output eval_results.json)
 
@@ -9,7 +9,7 @@ File written by Amy Metrick in collaboration with Anthropic's Claude Science Opu
 import argparse
 import numpy as np
 import pandas as pd
-from entexbert2.eval_utils import (load_hetsnv, seen_bins_from_meta, flag_leaky,
+from hapadapter.eval_utils import (load_hetsnv, seen_bins_from_meta, flag_leaky,
                                     pool_hetsnv_tissues, build_windows, score_pairs, dump_pools_npz)
 
 def eval_ref(args):
@@ -89,7 +89,7 @@ def eval_personal(args):
     ** leak flag is recomputed here from the hg38 anchor and --train_coords **
     NOTE: leaky rows are not dropped, just labeled (users should filter on the leaky column downstream)
     """
-    from entexbert2.model_io import run_inference
+    from hapadapter.model_io import run_inference
     df = pd.read_csv(args.windows_csv)
     pairs = [[s1, s2] for s1, s2 in zip(df["sequence1"].astype(str), df["sequence2"].astype(str))]
     logits, _emb, _rc = run_inference(args.checkpoint_dir, pairs,

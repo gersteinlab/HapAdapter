@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-entexbert2.eval_utils -- shared helpers for post-hoc scoring and interpretability:
+hapadapter.eval_utils -- shared helpers for post-hoc scoring and interpretability:
 - hetSNV data loading
 - train/test data leakage filter
 - window construction
@@ -214,7 +214,7 @@ def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20):
     return point, aupr, (lo, hi), m
 
 def score_pairs(df, seqs1, seqs2, keep, checkpoint_dir, batch_size=64, device="cuda", overrides=None, dump_embeddings=False):
-    from entexbert2.model_io import run_inference # IMPORTANT so torch is not imported here unecessarily!
+    from hapadapter.model_io import run_inference # IMPORTANT so torch is not imported here unecessarily!
     df = df.loc[keep].reset_index(drop=True)
     pairs = [[s1, s2] for s1, s2 in zip(np.asarray(seqs1)[keep], np.asarray(seqs2)[keep])]
     print(f"[score] running twin inference on {len(pairs)} variants "

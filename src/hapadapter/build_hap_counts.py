@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-entexbert2.build_hap_counts
+hapadapter.build_hap_counts
 
 Use: aggregate EN-TEx hetSNV read counts per (donor, locus) via tissue pooling
 into a per-locus haplotype-count table for the Stage-2 ASB head

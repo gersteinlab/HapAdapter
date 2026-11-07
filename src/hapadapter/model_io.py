@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-entexbert2.model_io -- shared model I/O for entexBERT-2 evaluation, scoring, and interpretability
+hapadapter.model_io -- shared model I/O for entexBERT-2 evaluation, scoring, and interpretability
 
 File written by Amy Metrick in collaboration with Claude Science Opus 5 Agent
 """
@@ -14,7 +14,7 @@ from typing import Optional
 import torch
 import transformers
 
-from entexbert2.model import entexBERT2ForSequencePrediction
+from hapadapter.model import entexBERT2ForSequencePrediction
 
 # ---------------------------------------------------------------------------
 # Config

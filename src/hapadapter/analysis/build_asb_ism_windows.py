@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-entexbert2.analysis.build_asb_ism_windows -- build AS/non-AS CSVs for ISM from a given eval set
+hapadapter.analysis.build_asb_ism_windows -- build AS/non-AS CSVs for ISM from a given eval set
 
 Each output row carries the same twin windows the model scored (score_individual.build_windows):
   sequence1 = reference/hap1 window  (allele1 substituted at the center of a 257bp hg38 window)
@@ -16,7 +16,7 @@ File written by Amy Metrick in collaboration with Anthropic's Claude Science Opu
 
 import argparse, os, numpy as np, pandas as pd
 from pyfaidx import Fasta
-from entexbert2.eval_utils import load_hetsnv, build_windows, seen_bins_from_meta, flag_leaky
+from hapadapter.eval_utils import load_hetsnv, build_windows, seen_bins_from_meta, flag_leaky
 
 def load_restrict(pv_csv, drop_leaky=True):
     """
@@ -166,7 +166,7 @@ def main():
     
     pg = None
     if a.sequence_mode == "personal":
-        from entexbert2.personal_seq import PersonalGenome, parse_chain_file
+        from hapadapter.personal_seq import PersonalGenome, parse_chain_file
         for name, val in (("hap1_fa", a.hap1_fa), ("hap2_fa", a.hap2_fa),
                             ("mat_chain", a.mat_chain), ("pat_chain", a.pat_chain)):
             if not val:

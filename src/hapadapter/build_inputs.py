@@ -1,5 +1,5 @@
 """
-entexbert2.build_inputs -- dataset construction for 2-stage SFT pipeline built on a DNABERT-2 backbone
+hapadapter.build_inputs -- dataset construction for 2-stage SFT pipeline built on a DNABERT-2 backbone
 
 Driven by two classes:
 1. RowSource (sequence)

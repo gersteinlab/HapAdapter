@@ -1,11 +1,11 @@
-"""entexbert2 -- two-stage transfer learning with a DNA transformer for predicting allele-specific activity
+"""hapadapter -- two-stage transfer learning with a DNA transformer for predicting allele-specific activity
 
 Stage 1 trains a binding trunk on reference-genome signal
 Stage 2 fine-tunes a twin contrast head on EN-TEx allele-specific read counts
 
 Public names are resolved LAZILY (PEP 562): 
-importing `entexbert2` itself pulls in no third-party package,
-so `import entexbert2` works in an environment without torch, pyBigWig or pyfaidx
+importing `hapadapter` itself pulls in no third-party package,
+so `import hapadapter` works in an environment without torch, pyBigWig or pyfaidx
 """
 
 __version__ = "0.1.0"

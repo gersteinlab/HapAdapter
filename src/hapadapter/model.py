@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-entexbert2.model —- the 2-stage ASB model
+hapadapter.model —- the 2-stage ASB model
 
   * task="regression"  (Stage-1 binding trunk):  mu = g(f(seq))
         One window -> one binding score,

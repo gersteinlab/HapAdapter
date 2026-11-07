@@ -36,7 +36,7 @@ from peft import (
 
 ## NEW IMPORTS ##################################################
 from scipy.stats import pearsonr, spearmanr # regression metrics
-from entexbert2.model import entexBERT2ForSequencePrediction
+from hapadapter.model import entexBERT2ForSequencePrediction
 #################################################################
 
 

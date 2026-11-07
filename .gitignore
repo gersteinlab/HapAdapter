@@ -1,4 +1,7 @@
 *.pyc
-DNABERT-2-117M-attention/pytorch_model.bin
 __pycache__/
-src/entexbert2.egg-info/DNABERT-2-117M-attention/pytorch_model.bin
+src/*.egg-info/
+build/
+dist/
+pytorch_model.bin
+*.safetensors

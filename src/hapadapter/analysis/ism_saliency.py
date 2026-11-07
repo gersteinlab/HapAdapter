@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-entexbert2.analysis.ism_saliency -- calculates ISM saliency from any entexBERT-2 checkpoint
+hapadapter.analysis.ism_saliency -- calculates ISM saliency from any entexBERT-2 checkpoint
 
 * regression  (Stage-1 binding trunk):  single-seq forward, target = binding score mu
     delta[w, i, b] = mu(sequence window w with position i mutated to base b) - mu(reference sequence window w)
@@ -113,7 +113,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
-    from entexbert2.model_io import run_inference, load_run_config
+    from hapadapter.model_io import run_inference, load_run_config
 
     task = load_run_config(a.checkpoint_dir).get("task", "regression")
     print(f"[ISM] checkpoint task = {task}  ->  "

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
 """
-entexbert2.build_experiment -- config-driven entexBERT-2 dataset runner (2-stage ASB pipeline)
+hapadapter.build_experiment -- config-driven entexBERT-2 dataset runner (2-stage ASB pipeline)
 
 Each experiment is a declarative config (YAML or JSON); this runner composes a row source
-with a primary label and calls the source-agnostic build_dataset in entexbert2.build_inputs.
+with a primary label and calls the source-agnostic build_dataset in hapadapter.build_inputs.
 
 New formats are added by:
     1. implementing a RowSource / make_*_label_spec in build_inputs
@@ -204,7 +204,7 @@ import sys
 
 from pyfaidx import Fasta
 
-from entexbert2.build_inputs import (
+from hapadapter.build_inputs import (
     BalanceSpec,
     PartitionSpec,
     WindowSpec,
@@ -216,7 +216,7 @@ from entexbert2.build_inputs import (
     log1p_transform,
     identity_transform,
 )
-from entexbert2.personal_seq import parse_chain_file, PersonalGenome
+from hapadapter.personal_seq import parse_chain_file, PersonalGenome
 
 NONE_TISSUE_TOKENS = {None, "null", "NONE", "None", "none", "", "all", "ALL"}
 

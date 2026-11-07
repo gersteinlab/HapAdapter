@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-entexbert2.analysis.score_external -- score ANY set of checkpoints on an EXTERNAL variant cohort
+hapadapter.analysis.score_external -- score ANY set of checkpoints on an EXTERNAL variant cohort
 (ADASTRA or similar), on a single shared locus set.
 
 This exists because the twin-vs-single comparison is only meaningful if both arms are scored on
@@ -115,7 +115,7 @@ def main():
                          "window diagnostics without loading any model. RUN THIS FIRST.")
     a = ap.parse_args()
 
-    from entexbert2.eval_utils import seen_bins_from_meta, flag_leaky, build_windows, balanced_auroc
+    from hapadapter.eval_utils import seen_bins_from_meta, flag_leaky, build_windows, balanced_auroc
 
     # ---- head variants first: a bad path must fail before any slow work ------------------------
     variants = [head_variant_of(c) for c in a.checkpoints]
@@ -186,7 +186,7 @@ def main():
         return
 
     # ---- score every checkpoint on the frozen set ----------------------------------------------
-    from entexbert2.model_io import run_inference
+    from hapadapter.model_io import run_inference
     rows = []
     for ckpt, variant, lab in zip(a.checkpoints, variants, labels):
         if variant == "twin":

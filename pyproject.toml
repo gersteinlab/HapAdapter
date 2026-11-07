@@ -3,7 +3,7 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "entexbert2"
+name = "hapadapter"
 version = "0.1.0"
 description = "Two-stage transfer learning in a DNA transformer for predicting allele-specific behavior, built on a modified DNABERT-2 backbone"
 authors = [
@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Model definition, training and scoring -- required by entexbert2.model, model_io and finetune_entexbert2
+# Model definition, training and scoring -- required by hapadapter.model, model_io and finetune_entexbert2
 model = [
   "torch",
   "transformers",
@@ -38,7 +38,7 @@ model = [
   "peft",
 ]
 
-# For analysis and figure scripts under entexbert2.analysis
+# For analysis and figure scripts under hapadapter.analysis
 analysis = [
   "matplotlib",
   "logomaker",
@@ -46,16 +46,16 @@ analysis = [
 ]
 
 all = [
-  "entexbert2[model]",
-  "entexbert2[analysis]",
+  "hapadapter[model]",
+  "hapadapter[analysis]",
 ]
 
 [project.urls]
 Repository = "https://github.com/gersteinlab/entexBERT-2"
 
 [project.scripts]
-# `entexbert2-build path/to/config.yaml` == `python -m entexbert2.build_experiment ...`
-entexbert2-build = "entexbert2.build_experiment:main"
+# `hapadapter-build path/to/config.yaml` == `python -m hapadapter.build_experiment ...`
+hapadapter-build = "hapadapter.build_experiment:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

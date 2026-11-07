@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-entexbert2.select_heldout_chroms.py — deterministic, TF-agnostic held-out test chromosome selection
+hapadapter.select_heldout_chroms.py — deterministic, TF-agnostic held-out test chromosome selection
 
 Pure function of a per-chromosome positive-count table plus four documented, genome-level policy parameters
 Re-run on any TF's variant set to regenerate its held-out test set

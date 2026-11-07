@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-entexbert2.analysis.score_crossdonor -- cross-donor test set ASB-head scoring
+hapadapter.analysis.score_crossdonor -- cross-donor test set ASB-head scoring
 (both ref and personal test sets supported)
 
 Writes one per-head CSV: assay, train_donor, eval_donor, arm, donor_kind, auroc, n, n_pos
@@ -24,8 +24,8 @@ def _head_variant(head_dir):
 
 def score_on(head_dir, test_csv, batch_size, device):
     """Score one donor's test split; returns (auroc_matched, auroc_plain, n, n_pos, n_matched)"""
-    from entexbert2.model_io import run_inference # to keep --help torch-free
-    from entexbert2.eval_utils import balanced_auroc
+    from hapadapter.model_io import run_inference # to keep --help torch-free
+    from hapadapter.eval_utils import balanced_auroc
 
     df = pd.read_csv(test_csv)
     variant = _head_variant(head_dir)

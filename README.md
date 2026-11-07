@@ -43,11 +43,11 @@ pip install -e ".[analysis]"     # + matplotlib, logomaker, memelite -> figures
 pip install -e ".[all]"          # everything
 ```
 
-`import entexbert2` works in an environment without torch and only pulls a dependency when you touch a name that needs it:
+`import hapadapter` works in an environment without torch and only pulls a dependency when you touch a name that needs it:
 
 ```python
-from entexbert2 import build_dataset              # needs pyBigWig, not torch
-from entexbert2 import load_model_and_tokenizer   # needs torch
+from hapadapter import build_dataset              # needs pyBigWig, not torch
+from hapadapter import load_model_and_tokenizer   # needs torch
 ```
 
 ---
@@ -60,10 +60,10 @@ runs) `tracks.json`. `finetune_entexbert2.py` then trains from that directory.
 
 ```bash
 # 1. Stage 1 -- build + train the binding trunk (regression)
-python -m entexbert2.build_experiment configs/stage1_binding.yaml \
+python -m hapadapter.build_experiment configs/stage1_binding.yaml \
     --ref_fasta "$REF" --output_dir "$BUILD_S1"
 
-python -m entexbert2.finetune_entexbert2 \
+python -m hapadapter.finetune_entexbert2 \
     --model_name_or_path DNABERT-2-117M-attention --data_path "$BUILD_S1" \
     --task regression --input_mode ref_single \
     --pooling_mode center_mean --center_pool_width 5 \
@@ -73,10 +73,10 @@ python -m entexbert2.finetune_entexbert2 \
     --output_dir "$TRUNK"
 
 # 2. Stage 2 -- build + train the AS head on the frozen trunk (classification)
-python -m entexbert2.build_experiment configs/stage2_asb.yaml \
+python -m hapadapter.build_experiment configs/stage2_asb.yaml \
     --ref_fasta "$REF" --output_dir "$BUILD_S2"
 
-python -m entexbert2.finetune_entexbert2 \
+python -m hapadapter.finetune_entexbert2 \
     --model_name_or_path DNABERT-2-117M-attention --data_path "$BUILD_S2" \
     --task classification --input_mode hap_pair \
     --pooling_mode center_mean --center_pool_width 5 \
@@ -94,7 +94,7 @@ width, whether `--head_activation` and `--num_labels` are required
 A console script is installed as a shorthand for the build step:
 
 ```bash
-entexbert2-build configs/stage1_binding.yaml --ref_fasta "$REF" --output_dir "$BUILD_S1"
+hapadapter-build configs/stage1_binding.yaml --ref_fasta "$REF" --output_dir "$BUILD_S1"
 ```
 
 ---
@@ -134,7 +134,7 @@ Every config key, its default, and both runnable examples are documented in the
 `build_experiment.py` module docstring:
 
 ```bash
-python -c "import entexbert2.build_experiment as m; print(m.__doc__)"
+python -c "import hapadapter.build_experiment as m; print(m.__doc__)"
 ```
 
 The main blocks are `row_source` (where windows and labels come from), `primary_label`
@@ -162,19 +162,19 @@ and `sequence.chains` to name the same donors.
 ## Repository layout
 
 ```
-src/entexbert2/
-├── __init__.py              public API (import entexbert2 pulls no third-party package)
+src/hapadapter/
+├── __init__.py              public API (import hapadapter pulls no third-party package)
 ├── model.py                 2-stage model
 ├── model_io.py              run_config/weights loading, run_inference
 ├── build_inputs.py          row sources, labels, windowing, splits, balancing, writing
-├── build_experiment.py      config-driven dataset builder (python -m entexbert2.build_experiment)
+├── build_experiment.py      config-driven dataset builder (python -m hapadapter.build_experiment)
 ├── eval_utils.py            shared scoring helpers (window building, hetSNV loading)
 └── personal_seq.py          chain-file lift and personal-genome window extraction
 DNABERT-2-117M-attention/    vendored backbone modeling code (see Third-party code)
 ```
 
 Training, scoring and analysis modules are being migrated into this package and will appear
-under `src/entexbert2/` and `src/entexbert2/analysis/`.
+under `src/hapadapter/` and `src/hapadapter/analysis/`.
 
 ---
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-entexbert2.personal_seq
+hapadapter.personal_seq
 
 Use: lift hg38 reference loci into an individual's phased haplotype genomes and extract personal windows
 

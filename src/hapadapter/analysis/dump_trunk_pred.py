@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-entexbert2.analysis.dump_trunk_pred
+hapadapter.analysis.dump_trunk_pred
 -- dump Stage-1 binding trunk predictions (mu) vs actual label on the held-out test split per cell
 
 Currently configured for SCALAR TRUNKS ONLY (run_config num_labels == 1)
@@ -11,7 +11,7 @@ import argparse
 import numpy as np, pandas as pd
 
 def main():
-    from entexbert2.model_io import run_inference # keeps --help torch-free
+    from hapadapter.model_io import run_inference # keeps --help torch-free
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint_dir", required=True, help="the Stage-1 regression trunk")

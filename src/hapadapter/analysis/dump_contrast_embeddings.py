@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-entexbert2.analysis.dump_contrast_embeddings -- dump per-locus contrast representations
+hapadapter.analysis.dump_contrast_embeddings -- dump per-locus contrast representations
 
   * (Stage 1) TRUNK contrast: h1 - h2      (pool_ref - pool_alt, dimension = d_model)
         -- what the frozen trunk already produces, BEFORE the stage 2 learned projection
@@ -35,7 +35,7 @@ def main():
                     help="label column; numeric (e.g. 0.5 for '> 0.5 => positive') OR categorical AS/nonAS (as_label)")
     args = ap.parse_args()
 
-    from entexbert2.model_io import run_inference
+    from hapadapter.model_io import run_inference
 
     with open(args.data_csv) as f:
         rows = list(csv.DictReader(f))
