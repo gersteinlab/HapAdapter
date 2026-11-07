@@ -1,2 +1,0 @@
-checkpoint,task,head_variant,keys,tensors,head,full
-../../../../../home/asm242/palmer_scratch/entexbert2-models/experiments/atac_ENC-001/stage2_personal/runs/clf_s20_seed20,classification,twin,OK,OK,OK,OK

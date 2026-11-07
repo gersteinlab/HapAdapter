@@ -1,7 +1,8 @@
 *.pyc
+*.safetensors
 __pycache__/
-src/*.egg-info/
+backbones/weights/DNABERT-2-117M-attention/pytorch_model.bin
 build/
 dist/
 pytorch_model.bin
-*.safetensors
+src/*.egg-info/
