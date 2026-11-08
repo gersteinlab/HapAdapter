@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
-
 """
-hapadapter.model —- the 2-stage ASB model
+hapadapter.trunk.model —- functional fine-tuning of a pretrained DNA encoder
 
-  * task="regression"  (Stage-1 binding trunk):  mu = g(f(seq))
-        One window -> one binding score,
-        MSE on the (log1p fold-change) binding label (precision-weighted if depth column provided),
-        Single-track (scalar) or multi-track (one score per tissue) via num_labels
+Encoder -> pooled representation -> prediction head
 
-  * task="classification"  (Stage-2 ASB head, symmetric contrast):
-        s = ||P(h1) - P(h2)||, p = sigmoid(a*s + b),
-        Predicts P(ASB) from the DISTANCE between the two haplotype representations in a LEARNED projection,
-        Symmetric by construction,
-        Loss = Precision-weighted BCE
+  * task="regression": mu = head(pool(seq))
+        - One window -> one score
+        - MSE, optionally precision-weighted by depth
+        - Single-track (scalar) or multi-track (one score per tissue)
 
-File written by Amy Metrick in collaboration with Anthropic's Claude Science Opus 5 Agent
+  * task="classification": ell = head(pool(seq))
+        - One window -> one logit
+        - BCE, optionally precision-weighted
 """
 from typing import Optional
 
@@ -22,73 +19,16 @@ import torch
 import transformers
 from transformers.modeling_outputs import SequenceClassifierOutput
 
-def get_activation_module(name: str) -> torch.nn.Module:
-    name = name.lower()
-    if name == "gelu":
-        return torch.nn.GELU()
-    if name == "relu":
-        return torch.nn.ReLU()
-    if name == "tanh":
-        return torch.nn.Tanh()
-    if name == "silu":
-        return torch.nn.SiLU()
-    raise ValueError(f"Unsupported head activation {name!r} (gelu|relu|tanh|silu).")
+from hapadapter.model_utils import (
+    build_prediction_head,
+    get_activation_module,
+    neff_weight,
+)
 
-def build_prediction_head(
-    input_size: int,
-    output_size: int = 1,
-    num_layers: int = 1,
-    hidden_size: int = -1,
-    activation: str = "gelu",
-    dropout: float = 0.1,
-) -> torch.nn.Module:
+class FunctionalFinetuneForSequencePrediction(torch.nn.Module):
     """
-    num_layers counts total Linear layers:
-      1  -> Linear(input_size -> output_size)
-      2  -> Linear(input->hidden) + activation + dropout + Linear(hidden->output)
-      3+ -> deeper MLP
-    """
-    if num_layers < 1:
-        raise ValueError(f"num_layers must be >= 1, got {num_layers}.")
-    if hidden_size == -1:
-        hidden_size = input_size
-    if hidden_size <= 0:
-        raise ValueError(f"hidden_size must be positive or -1, got {hidden_size}.")
-    if not (0 <= dropout < 1):
-        raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
-
-    # Linear head
-    if num_layers == 1:
-        return torch.nn.Linear(input_size, output_size)
-
-    # MLP head
-    layers = [torch.nn.Linear(input_size, hidden_size),
-              get_activation_module(activation),
-              torch.nn.Dropout(dropout)]
-
-    for _ in range(num_layers - 2):
-        layers += [torch.nn.Linear(hidden_size, hidden_size),
-                   get_activation_module(activation),
-                   torch.nn.Dropout(dropout)]
-    layers.append(torch.nn.Linear(hidden_size, output_size))
-    return torch.nn.Sequential(*layers)
-
-class entexBERT2ForSequencePrediction(torch.nn.Module):
-    """
-    Stage-1 trunk (fine-tuned on binding affinity) -> Stage-2 head (task-selected)
-
-    task="regression"  (Stage-1 binding trunk):
-        forward scores one window through the trunk and regression head,
-        returns the binding score mu = head(pool(seq))
-        num_labels = 1 -> scalar (single-track);
-        num_labels > 1 -> one score per tissue (multi-track, masked over observed tissues)
-
-    task="classification" (Stage-2 ASB):
-        forward projects each window's pooled representation with a SHARED LEARNED projection P (768 -> proj_dim),
-        forms the distance s = ||P(h1) - P(h2)||_2, 
-        returns logit ell = a*s + b -> P(ASB) = sigmoid(ell)
-        Loss: precision-weighted BCE, L = sum_i w_i BCE(sigmoid(ell_i), y_i) / sum_i w_i,
-        where w_i = n_eff(n_i) = n_i (1 + s) / (n_i + s), normalized to mean 1, n_i = privileged total read depth
+    A pretrained DNA encoder fine-tuned on a functional genomics signal:
+    * Encoder (any HF AutoModel) -> pooled representation h -> main_head -> score *
     """
 
     def __init__(
@@ -102,11 +42,8 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         head_activation: str = "gelu",
         head_dropout: float = 0.1,
         neff_s: float = 20.0,
-        freeze_backbone: bool = False,
         task: str = "regression",
         num_labels: int = 1,
-        proj_dim: int = 128, # classification projection dimension
-        head_variant: str = "twin", # classification: "twin" (contrast) or "single" (one window)
     ):
         super().__init__()
         if pooling_mode not in ("cls", "center_mean", "mean"):
@@ -117,27 +54,23 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             raise ValueError(f"neff_s must be > 0, got {neff_s}.")
         if task not in ("regression", "classification"):
             raise ValueError(f"task must be 'regression' or 'classification', got {task!r}.")
-        num_labels = int(num_labels) # regression head width T (multi-track Stage-1 predicts one fold-change per tissue)
+
+        num_labels = int(num_labels) # head width T (multi-track target)
         if num_labels < 1:
             raise ValueError(f"num_labels must be >= 1, got {num_labels}.")
-        if task == "classification" and head_variant not in ("twin", "single"):
-            raise ValueError(
-                f"head_variant must be 'twin' or 'single' for classification, got {head_variant!r}."
-            )
+
         if task == "classification" and num_labels != 1:
             raise ValueError(
-                f"classification contrast head emits one P(ASB) logit; num_labels must be 1, "
-                f"got {num_labels}."
+                f"The current classification head only supports binary labels (one logit) -> num_labels must be 1, got {num_labels}."
             )
+            
         self.pooling_mode = pooling_mode
         self.center_pool_width = int(center_pool_width)
         self.neff_s = float(neff_s)
         self.task = task
         self.num_labels = num_labels
-        self.head_variant = (head_variant if task == "classification"
-                             else ("signed_pair" if head_variant == "signed_pair" else "twin"))
-
-        # Shared pretrained trunk (DNABERT-2-117M)
+    
+        # Pretrained encoder (any HF AutoModel with a tokenizer that emits input_ids)
         self.backbone = transformers.AutoModel.from_pretrained(
             model_name_or_path, cache_dir=cache_dir, trust_remote_code=True,
         )
@@ -145,99 +78,49 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         dropout_prob = getattr(self.backbone.config, "hidden_dropout_prob", 0.1)
         self.dropout = torch.nn.Dropout(dropout_prob)
 
-        head_input = hidden_size
+        self.main_head = build_prediction_head(
+            input_size=hidden_size,
+            output_size=self.num_labels,
+            num_layers=head_num_layers,
+            hidden_size=head_hidden_size,
+            activation=head_activation,
+            dropout=head_dropout,
+        )
 
-        if task == "regression":
-            self.main_head = build_prediction_head(
-                input_size=head_input, output_size=self.num_labels, num_layers=head_num_layers,
-                hidden_size=head_hidden_size, activation=head_activation, dropout=head_dropout,
-            )
-            # used for "twin" classification only
-            self.proj = None
-            self.dist_a = None
-            self.dist_b = None
-
-        elif head_variant == "single": # classification, ONE window -> plain logit (ablation control)
-            self.main_head = build_prediction_head(
-                input_size=head_input, output_size=1, num_layers=head_num_layers,
-                hidden_size=head_hidden_size, activation=head_activation, dropout=head_dropout,
-            )
-            self.proj = None
-            self.dist_a = None
-            self.dist_b = None
-
-        else: # classification "twin"
-            if proj_dim <= 0:
-                raise ValueError(f"proj_dim must be > 0 for classification, got {proj_dim}.")
-            self.proj = build_prediction_head(
-                input_size=head_input, output_size=proj_dim, num_layers=head_num_layers,
-                hidden_size=head_hidden_size, activation=head_activation, dropout=head_dropout,
-            )
-            # logit = a * s + b
-            # intialize so a = 1, b = 0 (identity mapping)
-            # a computed via softplus(a_raw) at forward: log(1 + e^(a_raw)) to enforce monotonicity, smoothness
-            # --> a_raw = ln(e − 1) = 0.5413, so that softplus(a_raw) = 1 at initialization
-            self.dist_a = torch.nn.Parameter(torch.tensor(0.5413))
-            self.dist_b = torch.nn.Parameter(torch.tensor(0.0))
-            self.main_head = None
-
-        if freeze_backbone:
-            self.freeze_backbone()
-
-    # ---- Stage-1 -> Stage-2 transfer ---------------------------------------
-    def freeze_backbone(self):
-        """Freeze the trunk so only the head trains (no collapse risk, reuses Stage 1)"""
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-
-    def unfreeze_backbone(self):
-        for p in self.backbone.parameters():
-            p.requires_grad = True
-
-    def init_backbone_from(self, checkpoint_path: str, map_location="cpu", include_head: Optional[bool] = None) -> int:
+    def init_backbone_from(self, checkpoint_path: str, map_location="cpu", include_head: bool = False) -> int:
         """
-        Load the `backbone.*` weights from a Stage-1 checkpoint state_dict into this model;
-        returns the number of tensors loaded.
+        Load the `backbone.*` weights from a fine-tuned checkpoint into this model
+        ** returns the number of tensors loaded **
 
-        include_head also restores `main_head.*`. It defaults to True only for
-        head_variant="signed_pair", whose readout mu(hap1) - mu(hap2) IS main_head(pool) applied
-        twice -- transferring the trunk's head starts that contrast at the trunk's measured allelic
-        Delta instead of at a random linear map. Every other arm trains a NEW task and keeps a fresh
-        head. Weights match BY NAME, so the head geometry must equal the checkpoint's.
+        include_head=True also restores `main_head.*`
+        (defaults to False because the intended use is transferring 
+        a conditioned encoder to a NEW task, whose head must start fresh)
         """
-        # Default by readout rather than by flag: a signed_pair model's mu IS main_head(pool), so
-        # transferring the trunk's head is the correct default there (it starts the contrast at the
-        # trunk's measured Delta). For the plain trunk / classification arms the head is a NEW task
-        # and must stay fresh, so they keep the old behaviour. No existing checkpoint is
-        # head_variant='signed_pair', so nothing already trained changes.
-        if include_head is None:
-            include_head = (self.head_variant == "signed_pair")
-
         sd = torch.load(checkpoint_path, map_location=map_location)
+        
         if isinstance(sd, dict) and "state_dict" in sd and "backbone.embeddings" not in str(sd.keys()):
             sd = sd["state_dict"]
+        
         prefixes = ("backbone.", "main_head.") if include_head else ("backbone.",)
         backbone_sd = {k: v for k, v in sd.items() if k.startswith(prefixes)}
+        
         if not any(k.startswith("backbone.") for k in backbone_sd):
             raise ValueError(
-                f"No 'backbone.*' keys found in {checkpoint_path}; got prefixes "
-                f"{sorted({k.split('.')[0] for k in sd})}. Is this an entexBERT2 checkpoint?"
+                f"No 'backbone.*' keys found in {checkpoint_path}; got prefixes {sorted({k.split('.')[0] for k in sd})}"
             )
+        
         if include_head and not any(k.startswith("main_head.") for k in backbone_sd):
             raise ValueError(
-                f"include_head=True but {checkpoint_path} has no 'main_head.*' keys; got prefixes "
-                f"{sorted({k.split('.')[0] for k in sd})}. A twin CLASSIFICATION checkpoint sets "
-                f"main_head = None and stores proj/dist_a/dist_b instead -- point at the Stage-1 "
-                f"regression trunk."
+                f"include_head=True but {checkpoint_path} has no 'main_head.*' keys; "
+                f"got prefixes {sorted({k.split('.')[0] for k in sd})}."
             )
+
         missing, unexpected = self.load_state_dict(backbone_sd, strict=False)
-        # 'missing' lists the fresh head params (these are expected); 'unexpected' should be empty!
+        # 'missing' lists the fresh head params (these should happen)
+        # 'unexpected' should be empty
         if unexpected:
             raise ValueError(f"Unexpected keys while loading backbone: {unexpected[:5]} ...")
         if include_head:
-            # A SHAPE mismatch does not raise under strict=False -- load_state_dict leaves the
-            # tensor at its random init and reports the key as missing. That silent path is exactly
-            # what this argument exists to prevent, so check it explicitly.
             still = [k for k in missing if k.startswith("main_head.")]
             if still:
                 raise ValueError(
@@ -284,70 +167,41 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             pooled.append(seq[b, start:end, :].mean(dim=0))
         return torch.stack(pooled, dim=0)
 
-    def _pool_one(self, input_ids, attention_mask, **kwargs):
+    def _pool_one(self, input_ids, attention_mask, apply_dropout=True, **kwargs):
         """One window -> pooled representation h in R^hidden"""
-        out = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
-                            return_dict=True, **kwargs)
-        return self.dropout(self._pool(out, attention_mask=attention_mask))
+        out = self.backbone(input_ids=input_ids, attention_mask=attention_mask, return_dict=True, **kwargs)
+        pooled = self._pool(out, attention_mask=attention_mask)
+        return self.dropout(pooled) if apply_dropout else pooled
 
     def _score_one(self, input_ids, attention_mask, **kwargs):
-        """One window -> binding logit(s) + fused representation (regression head)
-
-        Returns (B,) when num_labels = 1 and (B, T) when num_labels = T > 1
+        """
+        One window -> logit(s) + fused representation
+        ** returns (B,) when num_labels = 1 and (B, T) when num_labels = T > 1 **
         """
         pooled = self._pool_one(input_ids, attention_mask, **kwargs)
-        out = self.main_head(pooled)                      # (B, T)
+        out = self.main_head(pooled)  # (B, T)
         if self.num_labels == 1:
-            out = out.squeeze(-1)                         # (B,)
+            out = out.squeeze(-1)     # (B,)
         return out, pooled
 
-    # ---- precision weight --------------------------------------------
+    # (Optional) precision weighting
     def _neff_weight(self, depth, like):
-        """w_i = n_eff(n_i) normalized to mean 1; falls back to ones if depth is None"""
-        if depth is None:
-            return torch.ones_like(like)
-        n = depth.float().view_as(like).clamp(min=1.0)
-        s = self.neff_s
-        w = n * (1.0 + s) / (n + s)          # n_eff, saturates at 1 + s
-        return w / w.mean()                  # normalize to mean 1 (LR-invariant)
+        """Wrapper over model_utils.neff_weight, bound to this model's neff_s"""
+        return neff_weight(depth, like, self.neff_s)
 
-    # ---- Forward -----------------------------------------------------------
     def forward(
         self,
         input_ids=None,            # hap1 window (sequence1)
         attention_mask=None,
         input_ids_alt=None,        # hap2 window (sequence2)
         attention_mask_alt=None,
-        labels=None,               # regression: binding label, (B,) scalar or (B,T) per-track; classification: 0/1 AS
-        depth=None,                # n = read depth (privileged; weight only)
-        label_mask=None,           # (B,T) 0/1 observed-tissue mask for multi-track Stage-1 (no mask => all observed)
+        labels=None,               # regression: binding label, (B,) scalar or (B,T) per-track; classification: 0/1
+        depth=None,                # n = depth (privileged; weight only)
+        label_mask=None,           # (B,T) 0/1 observed mask for multi-track targets (no mask => all observed)
         **kwargs,
     ):
         if self.task == "classification":
-            if self.head_variant == "single": # for single window class control
-                ell, _ = self._score_one(input_ids, attention_mask, **kwargs)
-                loss = None
-                if labels is not None:
-                    y = labels.float().view_as(ell)
-                    w = self._neff_weight(depth, ell)
-                    bce = torch.nn.functional.binary_cross_entropy_with_logits(ell, y, reduction="none")
-                    loss = (w * bce).mean()
-                return SequenceClassifierOutput(loss=loss, logits=ell.unsqueeze(-1))
-            
-            # otherwise: twin classification (symmetric contrast)
-            if input_ids_alt is None:
-                raise RuntimeError(
-                    "classification (contrast) head requires a paired (hap1, hap2) batch, but "
-                    "input_ids_alt did not reach forward. Use --input_mode hap_pair and the twin collator."
-                )
-            h1 = self._pool_one(input_ids, attention_mask, **kwargs)
-            h2 = self._pool_one(input_ids_alt, attention_mask_alt, **kwargs)
-            z1 = self.proj(h1)
-            z2 = self.proj(h2)
-            s = torch.linalg.vector_norm(z1 - z2, dim=-1)      # >= 0, symmetric in (h1, h2)
-            a = torch.nn.functional.softplus(self.dist_a)      # a > 0: distance monotone in P(ASB)
-            ell = a * s + self.dist_b                          # logit of P(ASB)
-
+            ell, _ = self._score_one(input_ids, attention_mask, **kwargs)
             loss = None
             if labels is not None:
                 y = labels.float().view_as(ell)
@@ -356,18 +210,10 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                 loss = (w * bce).mean()
             return SequenceClassifierOutput(loss=loss, logits=ell.unsqueeze(-1))
 
-        # regression: Stage-1 binding trunk (single window), or a SIGNED paired contrast
-        if self.head_variant == "signed_pair":
-            if input_ids_alt is None:
-                raise ValueError("head_variant='signed_pair' requires paired inputs "
-                                 "([hap1 window, hap2 window]).")
-            mu1, _ = self._score_one(input_ids, attention_mask, **kwargs)
-            mu2, _ = self._score_one(input_ids_alt, attention_mask_alt, **kwargs)
-            mu = mu1 - mu2      # antisymmetric: swapping haplotypes flips the sign exactly
-        else:
-            mu, _ = self._score_one(input_ids, attention_mask, **kwargs) # (B,) or (B,T) binding score
+        # regression: single-window functional score
+        mu, _ = self._score_one(input_ids, attention_mask, **kwargs) # (B,) or (B,T)
 
-        # multi-track Stage-1 (num_labels > 1): masked multi-output MSE
+        # multi-track (num_labels > 1): masked multi-output MSE over observed tissues
         if self.num_labels > 1:
             loss = None
             if labels is not None:
@@ -379,9 +225,9 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                 sq = m * (mu - y) ** 2
                 denom = m.sum().clamp(min=1.0)
                 loss = sq.sum() / denom
-            return SequenceClassifierOutput(loss=loss, logits=mu)  # (B, T), no unsqueeze
+            return SequenceClassifierOutput(loss=loss, logits=mu)  # (B, T)
 
-        # scalar path (num_labels == 1): single-track Stage-1 binding score
+        # scalar path (num_labels == 1): single-track functional score
         loss = None
         if labels is not None:
             y = labels.float().view_as(mu)

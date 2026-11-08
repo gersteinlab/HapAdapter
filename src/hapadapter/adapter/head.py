@@ -3,64 +3,16 @@
 hapadapter.adapter.head -- the HapAdapter head: hap1/hap2 trunk embeddings -> personalized prediction
 """
 
-from typing import Optional
 import torch
+
+from hapadapter.model_utils import (
+    build_prediction_head,
+    get_activation_module,
+    neff_weight,
+)
 
 # a_raw = ln(e - 1) -> softplus(a_raw) == 1, so twin readout starts as id map
 DIST_A_INIT = 0.5413
-
-def get_activation_module(name: str) -> torch.nn.Module:
-    name = name.lower()
-    if name == "gelu":
-        return torch.nn.GELU()
-    if name == "relu":
-        return torch.nn.ReLU()
-    if name == "tanh":
-        return torch.nn.Tanh()
-    if name == "silu":
-        return torch.nn.SiLU()
-    raise ValueError(f"Unsupported head activation {name!r}:"
-                        " choose from gelu, relu, tanh, silu, or add new activation"
-                        " to hapadapter.adapter.head.get_activation_module")
-
-def build_prediction_head(
-    input_size: int,
-    output_size: int = 1,
-    num_layers: int = 1,
-    hidden_size: int = -1,
-    activation: str = "gelu",
-    dropout: float = 0.1,
-) -> torch.nn.Module:
-    """
-    num_layers counts total Linear layers:
-      1  -> Linear(input_size -> output_size)
-      2  -> Linear(input->hidden) + activation + dropout + Linear(hidden->output)
-      3+ -> deeper MLP
-    """
-    if num_layers < 1:
-        raise ValueError(f"num_layers must be >= 1, got {num_layers}.")
-    if hidden_size == -1:
-        hidden_size = input_size
-    if hidden_size <= 0:
-        raise ValueError(f"hidden_size must be positive or -1, got {hidden_size}.")
-    if not (0 <= dropout < 1):
-        raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
-
-    # Linear head
-    if num_layers == 1:
-        return torch.nn.Linear(input_size, output_size)
-
-    # MLP head
-    layers = [torch.nn.Linear(input_size, hidden_size),
-              get_activation_module(activation),
-              torch.nn.Dropout(dropout)]
-
-    for _ in range(num_layers - 2):
-        layers += [torch.nn.Linear(hidden_size, hidden_size),
-                   get_activation_module(activation),
-                   torch.nn.Dropout(dropout)]
-    layers.append(torch.nn.Linear(hidden_size, output_size))
-    return torch.nn.Sequential(*layers)
 
 def build_head_modules(
     d_in: int,
@@ -118,6 +70,15 @@ def twin_logit(proj, dist_a, dist_b, dropout, h1, h2):
     s = torch.linalg.vector_norm(z1 - z2, dim=-1)      # >= 0, symmetric in (h1, h2)
     a = torch.nn.functional.softplus(dist_a)           # a > 0: logit monotone in the distance
     return a * s + dist_b
+
+def asb_loss(ell, labels, depth, neff_s):
+    """
+    Precision-weighted BCE on the ASB logit
+    """
+    y = labels.float().view_as(ell)
+    w = neff_weight(depth, ell, neff_s)
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(ell, y, reduction="none")
+    return (w * bce).mean()
 
 class HapAdapterHead(torch.nn.Module):
     """HapAdapter: pooled embeddings -> binary logit"""
