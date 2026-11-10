@@ -91,8 +91,8 @@ def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides
                if k.split(".")[0] in ("proj", "dist_a", "dist_b")}
     head = _head_from_weights(head_sd, pool_dropout=float(encoder.dropout.p))
 
-    from hapadapter.adapter.train import HapAdapterForAlleleSpecificPrediction
-    model = HapAdapterForAlleleSpecificPrediction(encoder, head, neff_s=run_config.get("neff_s", 20.0)).to(device)
+    from hapadapter.adapter.train import HapAdapterForPairedPrediction
+    model = HapAdapterForPairedPrediction(encoder, head, neff_s=run_config.get("neff_s", 20.0)).to(device)
     model.eval()
     return model, tokenizer, run_config
 
