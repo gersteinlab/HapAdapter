@@ -16,7 +16,7 @@ File written by Amy Metrick in collaboration with Anthropic's Claude Science Opu
 
 import argparse, os, numpy as np, pandas as pd
 from pyfaidx import Fasta
-from hapadapter.eval_utils import load_hetsnv, build_windows, seen_bins_from_meta, flag_leaky
+from hapadapter.scoring.stats import load_hetsnv, build_windows, seen_bins_from_meta, flag_leaky
 
 def load_restrict(pv_csv, drop_leaky=True):
     """
@@ -166,7 +166,7 @@ def main():
     
     pg = None
     if a.sequence_mode == "personal":
-        from hapadapter.personal_seq import PersonalGenome, parse_chain_file
+        from hapadapter.data.personal_seq import PersonalGenome, parse_chain_file
         for name, val in (("hap1_fa", a.hap1_fa), ("hap2_fa", a.hap2_fa),
                             ("mat_chain", a.mat_chain), ("pat_chain", a.pat_chain)):
             if not val:

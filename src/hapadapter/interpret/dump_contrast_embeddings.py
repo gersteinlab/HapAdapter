@@ -35,7 +35,7 @@ def main():
                     help="label column; numeric (e.g. 0.5 for '> 0.5 => positive') OR categorical AS/nonAS (as_label)")
     args = ap.parse_args()
 
-    from hapadapter.model_io import run_inference
+    from hapadapter.loading import run_inference
 
     with open(args.data_csv) as f:
         rows = list(csv.DictReader(f))

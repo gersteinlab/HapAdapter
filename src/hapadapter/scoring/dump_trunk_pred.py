@@ -11,7 +11,7 @@ import argparse
 import numpy as np, pandas as pd
 
 def main():
-    from hapadapter.model_io import run_inference # keeps --help torch-free
+    from hapadapter.loading import run_inference # keeps --help torch-free
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint_dir", required=True, help="the Stage-1 regression trunk")

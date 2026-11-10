@@ -34,10 +34,10 @@ from peft import (
     get_peft_model_state_dict,
 )
 
-## NEW IMPORTS ##################################################
+## NEW IMPORTS ###########################################################
 from scipy.stats import pearsonr, spearmanr # regression metrics
-from hapadapter.model import entexBERT2ForSequencePrediction
-#################################################################
+from hapadapter.trunk.model import FunctionalFinetuneForSequencePrediction
+##########################################################################
 
 
 @dataclass
@@ -517,7 +517,7 @@ def train():
     #########################################################################################
 
     # MODIFIED: load entexBERT-2 model
-    model = entexBERT2ForSequencePrediction(
+    model = FunctionalFinetuneForSequencePrediction(
         model_name_or_path=model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
         pooling_mode=model_args.pooling_mode,

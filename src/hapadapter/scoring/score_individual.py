@@ -9,7 +9,7 @@ File written by Amy Metrick in collaboration with Anthropic's Claude Science Opu
 import argparse
 import numpy as np
 import pandas as pd
-from hapadapter.eval_utils import (load_hetsnv, seen_bins_from_meta, flag_leaky,
+from hapadapter.scoring.stats import (load_hetsnv, seen_bins_from_meta, flag_leaky,
                                     pool_hetsnv_tissues, build_windows, score_pairs, dump_pools_npz)
 
 def eval_ref(args):
@@ -89,7 +89,7 @@ def eval_personal(args):
     ** leak flag is recomputed here from the hg38 anchor and --train_coords **
     NOTE: leaky rows are not dropped, just labeled (users should filter on the leaky column downstream)
     """
-    from hapadapter.model_io import run_inference
+    from hapadapter.loading import run_inference
     df = pd.read_csv(args.windows_csv)
     pairs = [[s1, s2] for s1, s2 in zip(df["sequence1"].astype(str), df["sequence2"].astype(str))]
     logits, _emb, _rc = run_inference(args.checkpoint_dir, pairs,

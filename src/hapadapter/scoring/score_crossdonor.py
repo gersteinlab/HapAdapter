@@ -24,8 +24,8 @@ def _head_variant(head_dir):
 
 def score_on(head_dir, test_csv, batch_size, device):
     """Score one donor's test split; returns (auroc_matched, auroc_plain, n, n_pos, n_matched)"""
-    from hapadapter.model_io import run_inference # to keep --help torch-free
-    from hapadapter.eval_utils import balanced_auroc
+    from hapadapter.loading import run_inference # to keep --help torch-free
+    from hapadapter.scoring.stats import balanced_auroc
 
     df = pd.read_csv(test_csv)
     variant = _head_variant(head_dir)

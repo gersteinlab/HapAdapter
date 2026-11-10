@@ -204,7 +204,7 @@ import sys
 
 from pyfaidx import Fasta
 
-from hapadapter.build_inputs import (
+from hapadapter.data.build_inputs import (
     BalanceSpec,
     PartitionSpec,
     WindowSpec,
@@ -216,7 +216,7 @@ from hapadapter.build_inputs import (
     log1p_transform,
     identity_transform,
 )
-from hapadapter.personal_seq import parse_chain_file, PersonalGenome
+from hapadapter.data.personal_seq import parse_chain_file, PersonalGenome
 
 NONE_TISSUE_TOKENS = {None, "null", "NONE", "None", "none", "", "all", "ALL"}
 

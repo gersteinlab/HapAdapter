@@ -113,7 +113,8 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
-    from hapadapter.model_io import run_inference, load_run_config
+    from hapadapter.loading import run_inference
+    from hapadapter.trunk.loading import load_run_config
 
     task = load_run_config(a.checkpoint_dir).get("task", "regression")
     print(f"[ISM] checkpoint task = {task}  ->  "

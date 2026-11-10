@@ -115,7 +115,7 @@ def main():
                          "window diagnostics without loading any model. RUN THIS FIRST.")
     a = ap.parse_args()
 
-    from hapadapter.eval_utils import seen_bins_from_meta, flag_leaky, build_windows, balanced_auroc
+    from hapadapter.scoring.stats import seen_bins_from_meta, flag_leaky, build_windows, balanced_auroc
 
     # ---- head variants first: a bad path must fail before any slow work ------------------------
     variants = [head_variant_of(c) for c in a.checkpoints]
@@ -186,7 +186,7 @@ def main():
         return
 
     # ---- score every checkpoint on the frozen set ----------------------------------------------
-    from hapadapter.model_io import run_inference
+    from hapadapter.loading import run_inference
     rows = []
     for ckpt, variant, lab in zip(a.checkpoints, variants, labels):
         if variant == "twin":
