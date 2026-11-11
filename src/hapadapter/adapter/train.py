@@ -174,10 +174,10 @@ def _trainer(model, train_ds, eval_ds, out_dir, *, lr, weight_decay, epochs, bat
                 f"transformers {transformers.__version__} TrainingArguments accepts neither "
                 f"'eval_strategy' nor 'evaluation_strategy'; pass the right name via extra_args."
             )
-                args[key] = "epoch"
+        args[key] = "epoch"
         if select_on:
             args["save_strategy"] = "epoch"
-            args["save_total_limit"] = 1
+            args["save_total_limit"] = 2
             args["load_best_model_at_end"] = True
             args["metric_for_best_model"] = f"eval_{select_on}"
             args["greater_is_better"] = select_on != "loss" # greater is better unless selecting on loss
