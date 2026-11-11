@@ -161,7 +161,7 @@ def main():
     enc, trunk, params, state, org = load_trunk(a.model_version)
 
     info = {}
-    t0, done_n = time.time(), 0
+    t0, done_n, n_amb, amb_chars = time.time(), 0, 0, set()
 
     def flush():
         K = np.array(keys)
@@ -175,7 +175,9 @@ def main():
             seq = str(df[col].iloc[i]).upper()
             bad = set(seq) - set(BASES + "N")
             if bad:
-                raise SystemExit(f"row {i} {col}: non-ACGTN characters {sorted(bad)[:4]}")
+                seq = "".join(c if c in BASES + "N" else "N" for c in seq) # replace all non ACGT with N
+                n_amb += 1
+                amb_chars |= bad
             emb = trunk(params, state, enc.encode(seq)[np.newaxis],
                         np.asarray([org], dtype=np.int32))
             # EVERY mode is reduced off this ONE forward, before `emb` is discarded
@@ -194,6 +196,12 @@ def main():
                   f"eta {(n_fwd - done_n) * el / done_n / 60:.1f} min", flush=True)
 
     flush()
+
+    if n_amb:
+        print(f"[ambiguity] {n_amb} of {n_fwd} windows contained non-ACGTN bases "
+              f"{sorted(amb_chars)[:6]} -- those positions encoded as N. The window is kept; "
+              f"only the ambiguous bases are masked.")
+
     for mode, w, dest in zip(a.pool, a.pool_width, a.out):
         eff_bp, src = info[mode]
         V = np.vstack(vals[mode])

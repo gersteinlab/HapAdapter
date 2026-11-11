@@ -14,7 +14,7 @@ from hapadapter.adapter.head import HapAdapterHead
 from hapadapter.adapter.train import PooledPairDataset, fit_cached, save_head
 from hapadapter.backbones.cache import cache_width, load_pair_cache, resolve_coord_columns
 
-def load_split(cache, pair_csv, meta_csv, label_col, depth_col, cov_col, transform, tag):
+def load_split(cache, pair_csv, meta_csv, label_col, depth_col, cov_col, transform, tag, min_ok_frac=0.0):
     """For one split, embeddings joined to the build's labels, depth, and coordinates"""
     pair = pd.read_csv(pair_csv)
     meta = pd.read_csv(meta_csv)
@@ -27,7 +27,7 @@ def load_split(cache, pair_csv, meta_csv, label_col, depth_col, cov_col, transfo
         raise SystemExit(f"{pair_csv}: no {label_col!r} column; present: {list(pair.columns)}")
     cc, pc = resolve_coord_columns(meta, meta_csv)
 
-    got = load_pair_cache(cache, meta[cc], meta[pc], transform=transform, tag=tag)
+    got = load_pair_cache(cache, meta[cc], meta[pc], transform=transform, tag=tag, min_ok_frac=min_ok_frac)
     ok = got["ok"]
     n_miss = int((~ok).sum())
     if n_miss:
@@ -65,6 +65,9 @@ def main():
                     help="the build's precision weight")
     ap.add_argument("--cov_col", default="total_reads",
                     help="coverage column in the META table")
+    ap.add_argument("--min_ok_frac", type=float, default=0.0,
+                    help="minimum fraction of the meta table's loci that must be in the cache. "
+                         "Default 0 for a full build. Adjust if you are sampling.")
     ap.add_argument("--head_variant", default="twin", choices=["twin", "single"])
     ap.add_argument("--proj_dim", type=int, default=128)
     ap.add_argument("--head_num_layers", type=int, default=1)
@@ -84,7 +87,8 @@ def main():
     ap.add_argument("--out_dir", required=True)
     a = ap.parse_args()
 
-    train = load_split(a.train_cache, a.train_pair, a.train_meta, a.label_col, a.depth_col, a.cov_col, "auto", "train")
+    train = load_split(a.train_cache, a.train_pair, a.train_meta, a.label_col, a.depth_col,
+                       a.cov_col, "auto", "train", a.min_ok_frac)
     xf = train["transform"]
 
     splits = {"train": train}
@@ -94,7 +98,7 @@ def main():
             continue
         splits[name] = load_split(cache, getattr(a, f"{name}_pair"),
                                   getattr(a, f"{name}_meta"), a.label_col, a.depth_col,
-                                  a.cov_col, xf, name)
+                                  a.cov_col, xf, name, a.min_ok_frac)
 
     widths = {k: v["D"] for k, v in splits.items()}
     if len(set(widths.values())) > 1:
