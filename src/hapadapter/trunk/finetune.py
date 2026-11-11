@@ -34,15 +34,15 @@ from peft import (
     get_peft_model_state_dict,
 )
 
-## NEW IMPORTS ###########################################################
+## NEW IMPORTS ##############################################################
 from scipy.stats import pearsonr, spearmanr # regression metrics
 from hapadapter.trunk.model import FunctionalFinetuneForSequencePrediction
-##########################################################################
-
+from hapadapter.trunk.loading import DEFAULT_MODEL_MAX_LENGTH, load_tokenizer
+#############################################################################
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="zhihan1996/DNABERT-2-117M", metadata={"help": "path to the DNABERT-2 backbone"}) # MODIFIED: change from facebook/opt-125m to DNABERT-2
+    model_name_or_path: Optional[str] = field(default=DEFAULT_CHECKPOINT, metadata={"help": "HF id or local path of the encoder to fine-tune; any AutoModel works"}) # MODIFIED: was facebook/opt-125m in DNABERT-2's train.py
     use_lora: bool = field(default=False, metadata={"help": "whether to use LoRA"})
     lora_r: int = field(default=8, metadata={"help": "hidden dimension for LoRA"})
     lora_alpha: int = field(default=32, metadata={"help": "alpha for LoRA"})
@@ -58,17 +58,9 @@ class ModelArguments:
     num_labels: int = field(default=1, metadata={"help": "regression head width T (multi-track Stage-1 = #tissue tracks; 1 = scalar)"})
     # NEW: privileged precision weighting w =  n(1+s)/(n+s) #################################################
     neff_s: float = field(default=20.0, metadata={"help": "n_eff saturation cap s (0 = unweighted)"})
-    # NEW: classification (contrast head) projection dimension d for delta = ||P(h1) - P(h2)|| ##############
-    proj_dim: int = field(default=128, metadata={"help": "classification: shared projection dim d"})
-    # NEW: twin and regular (single sequence) classification head architecture options ######################
-    head_variant: str = field(default="auto", metadata={"help": "classification head: 'twin' "
-        "(contrast over hap1/hap2), 'single' (one window, ablation control), or 'auto' = derive "
-        "from --input_mode (hap_pair->twin, ref_single->single)"})
-    # NEW: 2-stage transfer learning ########################################################################
+    # NEW: Explicit encoder transfer ########################################################################
     init_backbone_from: Optional[str] = field(default=None,
-        metadata={"help": "path to a Stage-1 checkpoint; loads backbone.* weights only"})
-    freeze_backbone: bool = field(default=False,
-        metadata={"help": "freeze the backbone (Stage 2: train the twin head only)"})
+        metadata={"help": "path to a conditioned checkpoint; loads backbone.* weights only"})
     #########################################################################################################
 
 @dataclass
@@ -77,7 +69,7 @@ class DataArguments:
     # MODIFIED: removed kmer argument (was DNABERT(1) legacy)
     # NEW: regression task capabilities and streamline haplotype pair input format ######################################################################################
     task: str = field(default="regression", metadata={"help": "'regression' (Stage-1 binding trunk, single window) or 'classification' (Stage-2 ASB contrast head)"})
-    input_mode: str = field(default="hap_pair", metadata={"help": "'hap_pair' (twin, Stage 2) or 'ref_single' (one window, Stage 1)"})
+    input_mode: str = field(default="ref_single", metadata={"help": "'ref_single' is the only option here. Use adapter/train.py for hap_pair training."})
     #####################################################################################################################################################################
 
 @dataclass
@@ -85,7 +77,8 @@ class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     run_name: str = field(default="run")
     optim: str = field(default="adamw_torch")
-    model_max_length: int = field(default=512, metadata={"help": "Maximum sequence length."})
+    # MODIFIED: model_max_length defaults to DEFAULT_MODEL_MAX_LENGTH, not 512
+    model_max_length: int = field(default=DEFAULT_MODEL_MAX_LENGTH, metadata={"help": "maximum sequence length in TOKENS."})
     gradient_accumulation_steps: int = field(default=1)
     per_device_train_batch_size: int = field(default=1)
     per_device_eval_batch_size: int = field(default=1)
@@ -324,11 +317,7 @@ def calculate_multitrack_metrics(predictions, y, mask):
     return out
 ##############################################################################################
 
-# NEW: classification metrics (contrast head) ##################################################################
-# The model emits ell = logit P(ASB) (higher = more allele-specific)
-#   PRIMARY (threshold-free, honest for rare-positive data): auroc, auprc;
-#           rank on ell directly (NOT |ell|)
-#   DIAGNOSTIC for context only (threshold at ell=0, i.e. p=0.5): mcc/precision/recall/f1
+# NEW: classification metrics ##################################################################################
 # NOTE: this function logically replaces original calculate_metric_with_sklearn function from DNABERT-2 train.py
 def calculate_classification_metrics(predictions: np.ndarray, labels: np.ndarray):
     ell = np.asarray(predictions, dtype=float).reshape(-1)
@@ -341,10 +330,10 @@ def calculate_classification_metrics(predictions: np.ndarray, labels: np.ndarray
         "pos_rate": float(n_pos / n) if n else float("nan"),
     }
     if 0 < n_pos < n:
-        out["auroc"] = float(sklearn.metrics.roc_auc_score(yb, ell))         # PRIMARY
-        out["auprc"] = float(sklearn.metrics.average_precision_score(yb, ell))  # PRIMARY
-        pred = (ell > 0.0).astype(int)                                       # threshold at p=0.5
-        out["mcc"] = float(sklearn.metrics.matthews_corrcoef(yb, pred))      # DIAGNOSTIC
+        out["auroc"] = float(sklearn.metrics.roc_auc_score(yb, ell)) 
+        out["auprc"] = float(sklearn.metrics.average_precision_score(yb, ell))
+        pred = (ell > 0.0).astype(int)
+        out["mcc"] = float(sklearn.metrics.matthews_corrcoef(yb, pred))
         out["precision"] = float(sklearn.metrics.precision_score(yb, pred, zero_division=0))
         out["recall"] = float(sklearn.metrics.recall_score(yb, pred, zero_division=0))
         out["f1"] = float(sklearn.metrics.f1_score(yb, pred, zero_division=0))
@@ -445,44 +434,20 @@ def train():
         raise ValueError(f"--input_mode must be 'hap_pair' or 'ref_single', got {data_args.input_mode!r}.")
     #######################################################################################################
 
-    # load tokenizer
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-        model_max_length=training_args.model_max_length,
-        padding_side="right",
-        use_fast=True,
-        trust_remote_code=True,
-    )
+    # MODIFIED: load tokenizer (works for any encoder with detailed settings put in backbones/)
+    tokenizer = load_tokenizer({
+        "model_name_or_path": model_args.model_name_or_path,
+        "cache_dir": training_args.cache_dir,
+        "model_max_length": training_args.model_max_length,
+    })
 
-    if "InstaDeepAI" in model_args.model_name_or_path:
-        tokenizer.eos_token = tokenizer.pad_token
-
-    # NEW: resolve the classification head variant before datasets/model are built ############
-    if model_args.head_variant not in ("auto", "twin", "single", "signed_pair"):
-        raise ValueError(f"--head_variant must be 'auto', 'twin', 'single' or 'signed_pair', "
-                         f"got {model_args.head_variant!r}.")
-    if model_args.head_variant == "auto":
-        if data_args.task == "regression" and data_args.input_mode == "hap_pair":
-            raise ValueError(
-                "--task regression --input_mode hap_pair is ambiguous under --head_variant auto: "
-                "it resolves to 'twin', which for a REGRESSION task collapses to the single-window "
-                "trunk and SILENTLY IGNORES sequence2. Pass --head_variant signed_pair for the "
-                "antisymmetric contrast, or --input_mode ref_single for the plain trunk.")
-        model_args.head_variant = "twin" if data_args.input_mode == "hap_pair" else "single"
-        logging.warning(f"--head_variant auto -> {model_args.head_variant!r} "
-                        f"(from --input_mode {data_args.input_mode})")
-    if model_args.head_variant == "twin" and data_args.input_mode != "hap_pair":
-        raise ValueError("--head_variant twin needs --input_mode hap_pair (it scores a window PAIR)")
-    if model_args.head_variant == "single" and data_args.input_mode != "ref_single":
-        raise ValueError("--head_variant single needs --input_mode ref_single (it scores a SINGLE window)")
-    if model_args.head_variant == "signed_pair":
-        if data_args.input_mode != "hap_pair":
-            raise ValueError("--head_variant signed_pair needs --input_mode hap_pair "
-                             "(mu = mu(hap1) - mu(hap2) scores a window PAIR)")
-        if data_args.task != "regression":
-            raise ValueError("--head_variant signed_pair is a REGRESSION readout (signed allelic "
-                             "effect); pass --task regression")
+    # NEW: raise error on paired sequence input (likely would be user intending to train the hapadapter head) ###
+    if data_args.input_mode != "ref_single":
+        raise ValueError(
+            f"--input_mode {data_args.input_mode!r}: this script fine-tunes the ENCODER, and "
+            f"every readout it has scores ONE window. Use --input_mode ref_single here. "
+            f"To fit a contrast head, use hapadapter.adapter.train.")
+    ##############################################################################################################
 
     # define datasets and data collator [MODIFIED: added input_mode=data_args.input_mode for hap_pair]
     train_dataset = SupervisedDataset(tokenizer=tokenizer,
@@ -516,7 +481,7 @@ def train():
         training_args.label_names = ["labels"]
     #########################################################################################
 
-    # MODIFIED: load entexBERT-2 model
+    # MODIFIED: load DNABERT-2 backbone with precision weighting and regression options
     model = FunctionalFinetuneForSequencePrediction(
         model_name_or_path=model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -527,19 +492,14 @@ def train():
         head_activation=model_args.head_activation,
         head_dropout=model_args.head_dropout,
         neff_s=model_args.neff_s,
-        task=data_args.task, # selects head topology
-        num_labels=model_args.num_labels, # regression head width T (multi-track Stage-1)
-        proj_dim=model_args.proj_dim, # classification projection dimension
-        head_variant=model_args.head_variant, # "twin" or "single" for classification
+        task=data_args.task,
+        num_labels=model_args.num_labels, # regression head width T (multi-track)
     )
 
-    # NEW: 2-stage transfer ################################################################################
-        # Load a Stage-1 binding trunk (backbone only) -> optionally freeze it for Stage-2 (twin head train)
+    # NEW: Encoder transfer: backbone.* only, so the head starts fresh on the new task ###
     if model_args.init_backbone_from:
         model.init_backbone_from(model_args.init_backbone_from)
-    if model_args.freeze_backbone:
-        model.freeze_backbone()
-    ########################################################################################################
+    ######################################################################################
 
     # configure LoRA
     if model_args.use_lora:
@@ -555,7 +515,7 @@ def train():
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-    # NEW: persist the architecture so model_io.py can rebuild the model exactly for scoring ###
+    # NEW: persist the architecture so loading.py can rebuild the model exactly for scoring ###
     os.makedirs(training_args.output_dir, exist_ok=True)
     with open(os.path.join(training_args.output_dir, "run_config.json"), "w") as f:
         json.dump({
@@ -571,12 +531,9 @@ def train():
             "neff_s": model_args.neff_s,
             "task": data_args.task,
             "num_labels": model_args.num_labels, # regression head width T (multi-track Stage-1)
-            "proj_dim": model_args.proj_dim,
-            "head_variant": model_args.head_variant,
             "input_mode": data_args.input_mode,
             "use_lora": model_args.use_lora,
             "init_backbone_from": model_args.init_backbone_from,
-            "freeze_backbone": model_args.freeze_backbone,
             "balanced_sampler": training_args.balanced_sampler,
             "seed": training_args.seed,
         }, f, indent=2)

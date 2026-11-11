@@ -15,6 +15,7 @@ from hapadapter.trunk.loading import (
     load_model_weights,
     load_run_config,
     load_tokenizer,
+    DEFAULT_MODEL_MAX_LENGTH,
 )
 
 def _head_kind(state_dict) -> str:
@@ -174,7 +175,7 @@ def run_inference(checkpoint_dir, texts, batch_size=64, device="cpu", overrides=
             "this checkpoint scores ONE window, so window2 would be discarded. Pass "
             "dump_pools=True to get both windows' pooled embeddings back.")
 
-    mml = run_config.get("model_max_length", 512)
+    mml = run_config.get("model_max_length", DEFAULT_MODEL_MAX_LENGTH)
 
     all_logits, all_emb, all_ref, all_alt = [], [], [], []
     for i in range(0, len(texts), batch_size):

@@ -14,6 +14,8 @@ import transformers
 
 from hapadapter.trunk.model import FunctionalFinetuneForSequencePrediction
 
+DEFAULT_MODEL_MAX_LENGTH = 512
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -151,12 +153,21 @@ def build_model(run_config: dict, device: str = "cpu") -> torch.nn.Module:
     return model.to(device)
 
 def load_tokenizer(run_config: dict):
-    return transformers.AutoTokenizer.from_pretrained(
+    tok = transformers.AutoTokenizer.from_pretrained(
         run_config["model_name_or_path"],
         cache_dir=run_config.get("cache_dir"),
-        model_max_length=run_config.get("model_max_length", 512),
+        model_max_length=run_config.get("model_max_length", DEFAULT_MODEL_MAX_LENGTH),
+        padding_side="right",
+        use_fast=True,
         trust_remote_code=True,
     )
+    # collator pads with pad_token_id and derives attention_mask from it
+    if tok.pad_token_id is None:
+        raise ValueError(
+            f"{run_config['model_name_or_path']}: tokenizer has no pad_token_id, which the "
+            f"collator requires -- every batch is padded to its longest member. Encoders "
+            f"that come without one need it set here.")
+    return tok
 
 def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides: dict = None):
     run_config = apply_overrides(load_run_config(checkpoint_dir), overrides or {})
