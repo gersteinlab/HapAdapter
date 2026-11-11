@@ -144,8 +144,21 @@ class PooledPairDataset(torch.utils.data.Dataset):
 # Fitting
 # ---------------------------------------------------------------------------
 
+def _binary_metrics(eval_pred):
+    """AUROC/AUPRC on the head's single logit ell = softplus(a)*||z1-z2|| + b, for epoch-level model selection"""
+    import numpy as np
+    from sklearn.metrics import average_precision_score, roc_auc_score
+    logits, labels = eval_pred
+    ell = np.asarray(logits, dtype=float).reshape(-1)
+    y = (np.asarray(labels, dtype=float).reshape(-1) > 0.5).astype(int)
+    n_pos = int(y.sum())
+    if 0 < n_pos < len(y):
+        return {"auroc": float(roc_auc_score(y, ell)),
+                "auprc": float(average_precision_score(y, ell)), "n_pos": float(n_pos)}
+    return {"auroc": float("nan"), "auprc": float("nan"), "n_pos": float(n_pos)}
+
 def _trainer(model, train_ds, eval_ds, out_dir, *, lr, weight_decay, epochs, batch_size,
-             seed, extra_args=None):
+             seed, select_on="auroc", extra_args=None):
     """One place where TrainingArguments are set, so both backends agree on them"""
     import transformers
     args = dict(output_dir=out_dir, learning_rate=lr, weight_decay=weight_decay,
@@ -161,24 +174,31 @@ def _trainer(model, train_ds, eval_ds, out_dir, *, lr, weight_decay, epochs, bat
                 f"transformers {transformers.__version__} TrainingArguments accepts neither "
                 f"'eval_strategy' nor 'evaluation_strategy'; pass the right name via extra_args."
             )
-        args[key] = "epoch"
+                args[key] = "epoch"
+        if select_on:
+            args["save_strategy"] = "epoch"
+            args["save_total_limit"] = 1
+            args["load_best_model_at_end"] = True
+            args["metric_for_best_model"] = f"eval_{select_on}"
+            args["greater_is_better"] = select_on != "loss" # greater is better unless selecting on loss
     if extra_args:
         args.update(extra_args)
     return transformers.Trainer(
         model=model, args=transformers.TrainingArguments(**args),
-        train_dataset=train_ds, eval_dataset=eval_ds)
+        train_dataset=train_ds, eval_dataset=eval_ds,
+        compute_metrics=_binary_metrics if eval_ds is not None else None)
 
 def fit_cached(head, train, dev=None, *, neff_s=20.0, lr=1e-3, weight_decay=0.01, epochs=25,
-               batch_size=32, seed=20, out_dir="./head_run"):
+               batch_size=32, seed=20, out_dir="./head_run", select_on="auroc"):
     """Fit `head` on precomputed pooled embeddings. `train`/`dev` are PooledPairDataset"""
     model = CachedPairedPrediction(head, neff_s=neff_s)
     tr = _trainer(model, train, dev, out_dir, lr=lr, weight_decay=weight_decay, epochs=epochs,
-                  batch_size=batch_size, seed=seed)
+                  batch_size=batch_size, seed=seed, select_on=select_on)
     tr.train()
     return model, (tr.evaluate() if dev is not None else None)
 
 def fit_end_to_end(encoder, head, train, dev=None, *, neff_s=20.0, lr=1e-3, weight_decay=0.01,
-                   epochs=25, batch_size=8, seed=20, out_dir="./head_run",
+                   epochs=25, batch_size=8, seed=20, out_dir="./head_run", select_on="auroc",
                    data_collator=None, trainer_cls=None, extra_args=None):
     """
     Fit `head` with a live encoder (frozen but left in train() mode for dropout variation)
@@ -187,7 +207,7 @@ def fit_end_to_end(encoder, head, train, dev=None, *, neff_s=20.0, lr=1e-3, weig
     freeze_encoder(encoder)
     model = HapAdapterForPairedPrediction(encoder, head, neff_s=neff_s)
     tr = _trainer(model, train, dev, out_dir, lr=lr, weight_decay=weight_decay, epochs=epochs,
-                  batch_size=batch_size, seed=seed, extra_args=extra_args)
+                  batch_size=batch_size, seed=seed, select_on=select_on, extra_args=extra_args)
     if data_collator is not None:
         tr.data_collator = data_collator
     if trainer_cls is not None and trainer_cls is not transformers.Trainer:

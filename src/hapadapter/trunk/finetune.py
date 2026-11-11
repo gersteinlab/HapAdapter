@@ -3,15 +3,15 @@ This script is a modified version of the DNABERT-2 finetuning script,
 found at https://github.com/MAGICS-LAB/DNABERT_2/blob/main/finetune/train.py
 
 This modified version supports:
-- Continuous label prediction via a linear regression head
-- 2-stage fine-tune
+- Continuous label prediction via a regression head (including multi-track regression)
+- MLP head (not just linear)
+- Precision-weighted loss
+- Fine-tuning of general Encoder backbones (not just DNABERT-2)
 
 All modifications to the original script are wrapped in comments in the following format:
 ### NEW/MODIFIED: [description of addition/modification] ####
 ...
 #############################################################
-
-Last modified: 10/13/2026 by Amy Metrick
 """
 
 import os
@@ -42,13 +42,13 @@ from hapadapter.trunk.loading import DEFAULT_MODEL_MAX_LENGTH, load_tokenizer
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default=DEFAULT_CHECKPOINT, metadata={"help": "HF id or local path of the encoder to fine-tune; any AutoModel works"}) # MODIFIED: was facebook/opt-125m in DNABERT-2's train.py
+    model_name_or_path: Optional[str] = field(default="zhihan1996/DNABERT-2-117M", metadata={"help": "HF id or local path of the encoder to fine-tune; any AutoModel works"}) # MODIFIED: was facebook/opt-125m in DNABERT-2's train.py
     use_lora: bool = field(default=False, metadata={"help": "whether to use LoRA"})
     lora_r: int = field(default=8, metadata={"help": "hidden dimension for LoRA"})
     lora_alpha: int = field(default=32, metadata={"help": "alpha for LoRA"})
     lora_dropout: float = field(default=0.05, metadata={"help": "dropout rate for LoRA"})
     lora_target_modules: str = field(default="query,value", metadata={"help": "where to perform LoRA"})
-    # NEW: entexBERT-2 head / pooling architecture (used by entexBERT2ForSequencePrediction) ################
+    # NEW: MLP regression head option, different pooling modes #############################################
     pooling_mode: str = field(default="center_mean", metadata={"help": "'center_mean', 'mean', or 'cls'"})
     center_pool_width: int = field(default=5, metadata={"help": "odd width of the center-mean pool window"})
     head_num_layers: int = field(default=1, metadata={"help": "1 = linear head, >=2 = MLP head g_phi"})
@@ -56,12 +56,12 @@ class ModelArguments:
     head_activation: str = field(default="gelu")
     head_dropout: float = field(default=0.1)
     num_labels: int = field(default=1, metadata={"help": "regression head width T (multi-track Stage-1 = #tissue tracks; 1 = scalar)"})
-    # NEW: privileged precision weighting w =  n(1+s)/(n+s) #################################################
+    # NEW: privileged precision weighting w = n(1+s)/(n+s) #################################################
     neff_s: float = field(default=20.0, metadata={"help": "n_eff saturation cap s (0 = unweighted)"})
-    # NEW: Explicit encoder transfer ########################################################################
+    # NEW: Explicit encoder transfer #######################################################################
     init_backbone_from: Optional[str] = field(default=None,
         metadata={"help": "path to a conditioned checkpoint; loads backbone.* weights only"})
-    #########################################################################################################
+    ########################################################################################################
 
 @dataclass
 class DataArguments:
@@ -77,7 +77,7 @@ class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     run_name: str = field(default="run")
     optim: str = field(default="adamw_torch")
-    # MODIFIED: model_max_length defaults to DEFAULT_MODEL_MAX_LENGTH, not 512
+    # MODIFIED: model_max_length defaults to DEFAULT_MODEL_MAX_LENGTH, not hardcoded at 512
     model_max_length: int = field(default=DEFAULT_MODEL_MAX_LENGTH, metadata={"help": "maximum sequence length in TOKENS."})
     gradient_accumulation_steps: int = field(default=1)
     per_device_train_batch_size: int = field(default=1)
@@ -123,10 +123,9 @@ class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
     # MODIFIED: removed kmer argument (DNABERT(1) legacy)
-    def __init__(self, 
-                 data_path: str, 
-                 tokenizer: transformers.PreTrainedTokenizer,
-                 input_mode: str = "hap_pair"): # NEW: hap_pair reads two windows per example
+    def __init__(self,
+                 data_path: str,
+                 tokenizer: transformers.PreTrainedTokenizer):
 
         super(SupervisedDataset, self).__init__()
 
@@ -140,18 +139,10 @@ class SupervisedDataset(Dataset):
             raise ValueError(f"{data_path} is empty.")
         cols = rows[0].keys()
 
-        # NEW: checking new entexBERT-2 model arguments were passed correctly
-        if input_mode == "hap_pair":
-            if "sequence1" not in cols or "sequence2" not in cols:
-                raise ValueError(f"hap_pair needs sequence1,sequence2 columns; got {list(cols)}.")
-            logging.warning(f"hap_pair: two windows per example (task={input_mode and 'see --task'})...")
-            texts = [[r["sequence1"], r["sequence2"]] for r in rows]
-        else:
-            seqcol = "sequence" if "sequence" in cols else "sequence1"
-            logging.warning("ref_single: single window per example (task={input_mode and 'see --task'})...")
-            texts = [r[seqcol] for r in rows]
+        seqcol = "sequence" if "sequence" in cols else "sequence1"
+        texts = [r[seqcol] for r in rows]
 
-        # NEW: multi-track Stage-1 binding
+        # NEW: multi-track regression
         y_track_cols = sorted([c for c in cols if c.startswith("y_track_")],
                               key=lambda c: int(c.split("_")[-1]))
         self.multitrack = len(y_track_cols) > 0
@@ -175,25 +166,12 @@ class SupervisedDataset(Dataset):
         ####################################################################################################
 
         # MODIFIED: removed kmer != -1 branch
-
-        # MODIFIED: for hap_pair, tokenize the two windows SEPARATELY rather than [SEP]-concatenating
-        self.input_mode = input_mode
-        if input_mode == "hap_pair":
-            enc1 = tokenizer([t[0] for t in texts], return_tensors="pt", padding="longest",
-                             max_length=tokenizer.model_max_length, truncation=True)
-            enc2 = tokenizer([t[1] for t in texts], return_tensors="pt", padding="longest",
-                             max_length=tokenizer.model_max_length, truncation=True)
-            self.input_ids = enc1["input_ids"]
-            self.attention_mask = enc1["attention_mask"]
-            self.input_ids_alt = enc2["input_ids"]
-            self.attention_mask_alt = enc2["attention_mask"]
-        else:
-            enc = tokenizer(texts, return_tensors="pt", padding="longest",
-                            max_length=tokenizer.model_max_length, truncation=True)
-            self.input_ids = enc["input_ids"]
-            self.attention_mask = enc["attention_mask"]
-            self.input_ids_alt = None
-            self.attention_mask_alt = None
+        
+        # MODIFIED: generic encoder
+        enc = tokenizer(texts, return_tensors="pt", padding="longest",
+                        max_length=tokenizer.model_max_length, truncation=True)
+        self.input_ids = enc["input_ids"]
+        self.attention_mask = enc["attention_mask"]
 
         self.labels = labels
         # NEW: multi-track -> T outputs; scalar path -> 1
@@ -204,10 +182,8 @@ class SupervisedDataset(Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        # MODIFIED: emit the twin pair + float label (+ depth weight when present)
+        # MODIFIED: float label (+ depth weight when present)
         item = dict(input_ids=self.input_ids[i], labels=self.labels[i])
-        if self.input_ids_alt is not None:
-            item["input_ids_alt"] = self.input_ids_alt[i]
         if self.depth is not None:
             item["depth"] = self.depth[i]
         # NEW: multi-track observed-tissue mask
@@ -235,15 +211,6 @@ class DataCollatorForSupervisedDataset(object):
             labels=torch.tensor(labels, dtype=torch.float),
             attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
-        
-        # NEW: pad + attach the second (alt) window when present (twin input)
-        if "input_ids_alt" in instances[0]:
-            alt = torch.nn.utils.rnn.pad_sequence(
-                [instance["input_ids_alt"] for instance in instances],
-                batch_first=True, padding_value=self.tokenizer.pad_token_id
-            )
-            batch["input_ids_alt"] = alt
-            batch["attention_mask_alt"] = alt.ne(self.tokenizer.pad_token_id)
         
         # NEW: carry the privileged depth weight through to the loss (crucially NOT the model input)
         if "depth" in instances[0]:
@@ -274,7 +241,7 @@ def calculate_regression_metrics(predictions: np.ndarray, labels: np.ndarray):
     return out
 ##############################################################################################
 
-# NEW: multi-track regression metrics (Stage-1, one target per tissue) ########################
+# NEW: multi-track regression metrics (e.g. one target per tissue) ###########################
 # predictions/y/mask are (N, T), only observed entries (mask=1) count
 #   mse       : masked-pooled MSE over all observed (locus, tissue) entries
 #   pearson   : masked-pooled Pearson over the same
@@ -449,17 +416,13 @@ def train():
             f"To fit a contrast head, use hapadapter.adapter.train.")
     ##############################################################################################################
 
-    # define datasets and data collator [MODIFIED: added input_mode=data_args.input_mode for hap_pair]
+    # define datasets and data collator
     train_dataset = SupervisedDataset(tokenizer=tokenizer,
-                                    data_path=os.path.join(data_args.data_path, "train.csv"),
-                                    input_mode=data_args.input_mode)
-    val_dataset = SupervisedDataset(tokenizer=tokenizer, 
-                                    data_path=os.path.join(data_args.data_path, "dev.csv"), 
-                                    input_mode=data_args.input_mode)
-    test_dataset = SupervisedDataset(tokenizer=tokenizer, 
-                                    data_path=os.path.join(data_args.data_path, "test.csv"), 
-                                    input_mode=data_args.input_mode)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+                                    data_path=os.path.join(data_args.data_path, "train.csv"))
+    val_dataset = SupervisedDataset(tokenizer=tokenizer,
+                                    data_path=os.path.join(data_args.data_path, "dev.csv"))
+    test_dataset = SupervisedDataset(tokenizer=tokenizer,
+                                    data_path=os.path.join(data_args.data_path, "test.csv"))
 
     # NEW: reconcile head width with the dataset before building the model #################
     _ds_labels = train_dataset.num_labels
@@ -481,7 +444,7 @@ def train():
         training_args.label_names = ["labels"]
     #########################################################################################
 
-    # MODIFIED: load DNABERT-2 backbone with precision weighting and regression options
+    # MODIFIED: load Encoder backbone with precision weighting and regression options
     model = FunctionalFinetuneForSequencePrediction(
         model_name_or_path=model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
