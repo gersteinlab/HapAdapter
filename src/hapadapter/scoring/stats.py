@@ -1,19 +1,12 @@
 #!/usr/bin/env python
 
 """
-hapadapter.eval_utils -- shared helpers for post-hoc scoring and interpretability:
-- hetSNV data loading
-- train/test data leakage filter
-- window construction
-- inference setup for twin sequences input (both haplotypes for stage 2)
-
-File written by Amy Metrick in collaboration with Anthropic's Claude Science Opus 5 Agent
+hapadapter.stats -- shared helpers for post-hoc scoring and interpretability
 """
 
 import os
 import numpy as np
 import pandas as pd
-from pyfaidx import Fasta
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 _BASECOL = {"A": "cA", "C": "cC", "G": "cG", "T": "cT"}
@@ -103,6 +96,7 @@ def flag_leaky(df, seen, bin_size, chrom_col, pos_col, pos_is_1based):
     return np.array([b in seen for b in pairs])
 
 def build_windows(df, ref_fasta, left_bp, right_bp, chrom_col, pos_col, refbase_col, a1_col, a2_col, pos_is_1based, drop_refmismatch=False):
+    from pyfaidx import Fasta
     fa = Fasta(ref_fasta, sequence_always_upper=True)
     win = left_bp + 1 + right_bp
     seqs1, seqs2, keep = [], [], []
@@ -165,6 +159,9 @@ def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20):
     m = min(len(pos_idx), len(neg_idx))
 
     if m < 10:
+        if n_boot:
+            print(f"[auroc] only {m} in the smaller class (<10) -- returning NaN. "
+                  f"{len(pos_idx)} positive / {len(neg_idx)} negative.")
         return np.nan, np.nan, (np.nan, np.nan), m
 
     rng = np.random.default_rng(seed)
@@ -181,22 +178,52 @@ def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20):
         large = neg_idx if len(pos_idx) <= len(neg_idx) else pos_idx
         edges = np.quantile(lc[small], np.linspace(0, 1, n_qbins + 1))
         edges[0] -= 1e-6; edges[-1] += 1e-6
-        sb = np.digitize(lc[small], edges); lb = np.digitize(lc[large], edges)
-        picks = []
+        sb = np.digitize(lc[small], edges)
+        lb = np.digitize(lc[large], edges)
+        picks, keep_small = [], []
+        n_dup = n_unmatched = 0
 
         for b in np.unique(sb):
-            pool = large[lb == b]; want = int((sb == b).sum())
-            if len(pool):
-                picks.append(rng.choice(pool, size=want, replace=len(pool) < want))
+            pool = large[lb == b]
+            small_b = small[sb == b]
+            want = len(small_b)
+            if not len(pool):
+                # No large-class member shares this coverage bin, 
+                # so these small-class members have no match -> drop them
+                n_unmatched += want
+                continue
+            rep = len(pool) < want
+            n_dup += max(want - len(pool), 0)
+            picks.append(rng.choice(pool, size=want, replace=rep))
+            keep_small.append(small_b)
 
+        sel_small = np.concatenate(keep_small) if keep_small else small[:0]
         sel_large = np.concatenate(picks) if picks else large[:0]
-        
+
+        # Drop large-class rows outside the small class's coverage range
+        n_oor = int((lb == 0).sum() + (lb == len(edges)).sum())
+        if n_boot and (n_oor or n_unmatched or n_dup):
+            print(f"[auroc] coverage match: {len(sel_small)} per class | "
+                  f"{n_oor} large-class rows outside the matched range "
+                  f"({n_oor/max(len(large),1):.1%}), {n_unmatched} small-class rows with no "
+                  f"partner, {n_dup} drawn with replacement")
+
         if len(pos_idx) <= len(neg_idx):
-            sel_pos, sel_neg = small, sel_large
+            sel_pos, sel_neg = sel_small, sel_large
         else:
-            sel_pos, sel_neg = sel_large, small
+            sel_pos, sel_neg = sel_large, sel_small
 
     m = min(len(sel_pos), len(sel_neg))
+    assert cover is None or len(sel_pos) == len(sel_neg), \
+        f"coverage match left {len(sel_pos)} vs {len(sel_neg)} -- not a balanced comparison"
+
+    if m < 10:
+        if n_boot:
+            print(f"[auroc] coverage matching left only {m} per class (<10) -- returning NaN. "
+                  f"The two classes' coverage distributions barely overlap, so there is no "
+                  f"depth-matched comparison to make here.")
+        return np.nan, np.nan, (np.nan, np.nan), m
+
     idx = np.concatenate([sel_pos, sel_neg])
     y = label[idx]; s = score[idx]
 

@@ -70,8 +70,8 @@ def main():
                          "Default 0 for a full build. Adjust if you are sampling.")
     ap.add_argument("--head_variant", default="twin", choices=["twin", "single"])
     ap.add_argument("--proj_dim", type=int, default=128)
-    ap.add_argument("--head_num_layers", type=int, default=1)
-    ap.add_argument("--head_hidden_size", type=int, default=-1)
+    ap.add_argument("--head_num_layers", type=int, default=2)
+    ap.add_argument("--head_hidden_size", type=int, default=128)
     ap.add_argument("--head_activation", default="gelu")
     ap.add_argument("--head_dropout", type=float, default=0.1)
     ap.add_argument("--pool_dropout", type=float, default=0.1)
@@ -143,9 +143,10 @@ def main():
         from hapadapter.scoring.stats import balanced_auroc
         t = splits["test"]
         model.eval()
+        _dev = next(model.parameters()).device
         with torch.no_grad():
-            ell = model(torch.as_tensor(t["h1"], dtype=torch.float32),
-                        torch.as_tensor(t["h2"], dtype=torch.float32))["logits"]
+            ell = model(torch.as_tensor(t["h1"], dtype=torch.float32).to(_dev),
+                        torch.as_tensor(t["h2"], dtype=torch.float32).to(_dev))["logits"]
         ell = ell.squeeze(-1).cpu().numpy()
         y = (t["y"] > 0.5).astype(int)
 
