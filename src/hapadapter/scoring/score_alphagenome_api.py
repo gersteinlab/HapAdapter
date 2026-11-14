@@ -25,6 +25,16 @@ def _client(api_key):
                          "check the installed alphagenome version")
     return mod, mod.create(api_key)
 
+BASES = "ACGT"
+
+def _sanitize(seq):
+    """Upper-case and replace every non-ACGTN base with N; return (seq, offending chars)"""
+    s = seq.upper()
+    bad = set(s) - set(BASES + "N")
+    if bad:
+        s = "".join(c if c in BASES + "N" else "N" for c in s)
+    return s, bad
+
 # assay -> (OutputType attribute, metadata attribute, metadata column holding the assay name)
 ASSAY_MAP = {
     "ctcf":     ("CHIP_TF",      "chip_tf",      "transcription_factor"),
@@ -188,7 +198,7 @@ def main():
         print(f"[cache] {len(done)} loci already scored")
 
     def score(seq):
-        out = client.predict_sequence(sequence=seq, organism=organism, requested_outputs=[ot])
+        out = client.predict_sequence(sequence=seq, organism=organism, requested_outputs=[ot], ontology_terms=None)
         td = getattr(out, md_attr)
         v = np.asarray(td.values, dtype=float) # (bins, tracks)
         idx, eff = center_mask(v.shape[0], seq_len, a.mask_width)
@@ -197,14 +207,21 @@ def main():
     rows, eff_bp, n_new = [], None, 0
     import time
     t0 = time.time()
+    n_amb, amb_chars = 0, set()
+
     for i, (r, m) in enumerate(zip(pair.itertuples(index=False), meta.itertuples(index=False))):
         k = (f"{getattr(m, cc)}:{int(getattr(m, pc))}:{a.assay}:{a.mask_width}"
              f":{a.ontology or 'all'}:{int(keep.sum())}")
         if k in done:
             s1, s2 = done[k]
         else:
-            s1, eff_bp = score(str(r.sequence1))
-            s2, eff_bp = score(str(r.sequence2))
+            q1, bad1 = _sanitize(str(r.sequence1))
+            q2, bad2 = _sanitize(str(r.sequence2))
+            if bad1 or bad2:
+                n_amb += int(bool(bad1)) + int(bool(bad2))
+                amb_chars |= bad1 | bad2
+            s1, eff_bp = score(q1)
+            s2, eff_bp = score(q2)
             done[k] = (s1, s2)
             n_new += 1
             if n_new % 25 == 0:
@@ -223,6 +240,11 @@ def main():
     out = pd.DataFrame(rows, columns=["chr", "pos", "s1", "s2", "delta"])
     os.makedirs(os.path.dirname(a.out_csv) or ".", exist_ok=True)
     out.to_csv(a.out_csv, index=False)
+
+    if n_amb:
+        print(f"\n[ambiguity] {n_amb} of {2*len(out)} windows contained non-ACGTN bases "
+              f"{sorted(amb_chars)[:6]} -- those positions re-encoded as N and will be masked.")
+
     if eff_bp is None:
         print(f"\n[mask] requested {a.mask_width} bp -> effective width NOT MEASURED this run "
               f"(every locus came from --cache). Re-run one locus without the cache to report it.")

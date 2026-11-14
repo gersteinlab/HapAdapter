@@ -6,3 +6,4 @@ build/
 dist/
 pytorch_model.bin
 src/*.egg-info/
+src/hapadapter/backbones/weights/DNABERT-2-117M-attention/pytorch_model.bin
