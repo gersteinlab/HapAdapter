@@ -46,9 +46,11 @@ class CachedPairedPrediction(_PairedHeadBase):
 
 class HapAdapterForPairedPrediction(_PairedHeadBase):
     """Encoder + head"""
-    def __init__(self, encoder, head: HapAdapterHead, neff_s: float = 20.0):
+    def __init__(self, encoder, head: HapAdapterHead, neff_s: float = 20.0,
+                 apply_pool_dropout: bool = False):
         super().__init__(head, neff_s)
         self.encoder = encoder
+        self.apply_pool_dropout = bool(apply_pool_dropout)
 
     def forward(self, input_ids, attention_mask, input_ids_alt=None,
                 attention_mask_alt=None, labels=None, depth=None, **kwargs):
@@ -57,8 +59,8 @@ class HapAdapterForPairedPrediction(_PairedHeadBase):
                 "the contrast head requires a paired (hap1, hap2) batch, but input_ids_alt did "
                 "not reach forward. Use --input_mode hap_pair and the paired collator."
             )
-        h1 = self.encoder._pool_one(input_ids, attention_mask, apply_dropout=False)
-        h2 = self.encoder._pool_one(input_ids_alt, attention_mask_alt, apply_dropout=False)
+        h1 = self.encoder._pool_one(input_ids, attention_mask, apply_dropout=self.apply_pool_dropout)
+        h2 = self.encoder._pool_one(input_ids_alt, attention_mask_alt, apply_dropout=self.apply_pool_dropout)
         return self._finish(self.head(h1, h2), labels, depth)
 
 def freeze_encoder(encoder) -> int:
@@ -189,11 +191,14 @@ def _trainer(model, train_ds, eval_ds, out_dir, *, lr, weight_decay, epochs, bat
         compute_metrics=_binary_metrics if eval_ds is not None else None)
 
 def fit_cached(head, train, dev=None, *, neff_s=20.0, lr=1e-3, weight_decay=0.01, epochs=25,
-               batch_size=32, seed=20, out_dir="./head_run", select_on="auroc"):
-    """Fit `head` on precomputed pooled embeddings. `train`/`dev` are PooledPairDataset"""
+               batch_size=32, seed=20, out_dir="./head_run", select_on="auroc", extra_args=None):
+    """
+    Fit `head` on precomputed pooled embeddings,
+    `train`/`dev` are PooledPairDataset
+    """
     model = CachedPairedPrediction(head, neff_s=neff_s)
     tr = _trainer(model, train, dev, out_dir, lr=lr, weight_decay=weight_decay, epochs=epochs,
-                  batch_size=batch_size, seed=seed, select_on=select_on)
+                  batch_size=batch_size, seed=seed, select_on=select_on, extra_args=extra_args)
     tr.train()
     return model, (tr.evaluate() if dev is not None else None)
 
@@ -212,6 +217,7 @@ def fit_end_to_end(encoder, head, train, dev=None, *, neff_s=20.0, lr=1e-3, weig
         tr.data_collator = data_collator
     if trainer_cls is not None and trainer_cls is not transformers.Trainer:
         tr = trainer_cls(model=model, args=tr.args, train_dataset=train, eval_dataset=dev,
-                         data_collator=data_collator)
+                         data_collator=data_collator,
+                         compute_metrics=tr.compute_metrics)
     tr.train()
     return model, (tr.evaluate() if dev is not None else None)

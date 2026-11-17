@@ -1,5 +1,5 @@
 """
-hapadapter.build_inputs -- dataset construction for 2-stage SFT pipeline built on a DNABERT-2 backbone
+hapadapter.build_inputs -- dataset construction for predicting binding (regression) and ASB (classification)
 
 Driven by two classes:
 1. RowSource (sequence)
@@ -7,14 +7,10 @@ Driven by two classes:
 
 Separates resulting full (sequence, label) datasets into leak-free train/dev/test CSVs
 
-Current scope: TF binding affinity, ASB datasets
-
 New sources/labels can be added by:
 1. Writing the desired RowSource construction and make_*_label_spec function here
 2. Add the new RowSource class to build_experiment.ROW_SOURCE_BUILDERS
 3. Add the new LabelSpec builder function to build_experiment.LABEL_BUILDERS
-
-File written by Amy Metrick in collaboration with Anthropic's Claude Science Opus 5 Agent
 """
 
 import os
@@ -151,12 +147,12 @@ def assign_split_column(df: pd.DataFrame, spec: "PartitionSpec") -> np.ndarray:
     n = len(df)
     out = np.empty(n, dtype=object)
 
-    # Stage 1 (vectorized): loci on a held-out test chromosome -> 'test'
+    # Datasets for binding prediction (vectorized): loci on a held-out test chromosome -> 'test'
     test_chroms = [c for c, f in spec.fold_assignment.items() if f == spec.fold_id]
     is_test = np.isin(chroms, test_chroms) if test_chroms else np.zeros(n, dtype=bool)
     out[is_test] = "test"
 
-    # Stage 2 (vectorized): hash each UNIQUE genomic bin once, then map the fraction back to rows
+    # Datasets for ASB prediction (vectorized): hash each UNIQUE genomic bin once, then map the fraction back to rows
     nontest = ~is_test
     if nontest.any():
         bin_idx = positions[nontest] // int(spec.bin_size)                      # int64 tile index
@@ -230,7 +226,7 @@ def split_and_write_csvs(
     count_cols: Optional[List[str]] = None,
 ):
     """
-    Write entexBERT-2 dataset CSVs
+    Write dataset CSVs
 
     For each split, writes two files:
       - <split>.csv       : minimal Trainer input (sequence(s), label only)
@@ -1402,7 +1398,7 @@ class HaplotypeCountRowSource(RowSource):
 class MultiTissuePeakRowSource(RowSource):
     """
     Multi-tissue peak row source: one row per consensus peak locus (plus sampled background)
-    for Stage-1 binding supervision. Labels come from BigWig signal (not variants)
+    for binding prediction. Labels come from BigWig signal (not variants)
 
     datasets: [{tissue, peak_path, bigwig_path, [pval_path], [group]}, ...]
         group     -- optional TF name; when every entry has one, tracks are grouped by TF
@@ -1670,8 +1666,9 @@ class MultiTissuePeakRowSource(RowSource):
                 pmat = self._read_signal_matrix(chrom, sub["anchor"].tolist(), path_key="pval_path")
                 assign["mean_pval"] = np.nanmean(pmat, axis=1)  # detection-confidence signal
             
-            # Multi-track Stage-1: keep the PER-TISSUE fold-change vector instead of only its mean
-            # y_track_t = log1p(fold-change) in tissue t; m_track_t = 1 where that tissue was actually assayed at this locus (finite), 0 where missing; mat is (n, N_tissues),
+            # Multi-track binding prediction: keep the PER-TISSUE fold-change vector instead of only its mean
+            # y_track_t = log1p(fold-change) in tissue t; m_track_t = 1 where that tissue was actually assayed at this locus (finite), 
+            # 0 where missing; mat is (n, N_tissues),
             # column order == self.tissues. NaN (unassayed) -> masked out (m=0) and set to 0.0 so
             # the value is never read when masked
             for gi, cols in enumerate(self._group_cols):
@@ -1716,7 +1713,7 @@ class MultiTissuePeakRowSource(RowSource):
             if self._has_pval:
                 pmat = self._read_signal_matrix(chrom, sub["anchor"].tolist(), path_key="pval_path")
                 assign["mean_pval"] = np.nanmean(pmat, axis=1)
-            # For multi-track Stage-1: per-tissue LOW signal at the background anchor
+            # For multi-track binding prediction: per-tissue LOW signal at the background anchor
             for gi, cols in enumerate(self._group_cols):
                 with np.errstate(invalid="ignore"):
                     col = np.nanmean(mat[:, cols], axis=1) # merge tissues within the track/group
@@ -1758,7 +1755,7 @@ class MultiTissuePeakRowSource(RowSource):
                 "n_tissues_called", "cross_tissue_std", "mean_depth", "label_noise"]
         if self._has_pval:
             keep.append("mean_pval")
-        # For multi-track Stage-1: carry the per-tissue target + mask columns
+        # For multi-track binding prediction: carry the per-tissue target + mask columns
         T = len(self.tissues)
         y_cols = [f"y_track_{t}" for t in range(T)]
         m_cols = [f"m_track_{t}" for t in range(T)]

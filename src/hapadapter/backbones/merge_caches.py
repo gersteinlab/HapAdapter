@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 hapadapter.backbones.merge_caches -- combine sharded pair caches into the single file that
-fit_head expects.
+fit_adapter expects.
 
 WHY THIS EXISTS. extract_* shards by STRIDE (rows[shard::n_shards]), so N concurrent GPUs each
-produce a disjoint slice of the same locus list. fit_head takes one --train_cache, so the
+produce a disjoint slice of the same locus list. fit_adapter takes one --train_cache, so the
 slices have to be reunited. Nothing here is backbone-specific: it operates on the {keys, vals}
 cache format and never looks at what the vectors mean.
 

@@ -1,38 +1,37 @@
-"""hapadapter -- two-stage transfer learning with a DNA transformer for predicting allele-specific activity
+"""
+hapadapter --
+transfer learning protocol for genomic foundation models adapted to diploid personal epigenomes
 
-Stage 1 trains a binding trunk on reference-genome signal
-Stage 2 fine-tunes a twin contrast head on EN-TEx allele-specific read counts
-
-Public names are resolved LAZILY (PEP 562): 
+Public names are resolved lazily (PEP 562): 
 importing `hapadapter` itself pulls in no third-party package,
 so `import hapadapter` works in an environment without torch, pyBigWig or pyfaidx
 """
 
 __version__ = "0.1.0"
 
-# public name -> the submodule that defines it
+# Public name -> the submodule that defines it
 _EXPORTS = {
     # dataset building
-    "build_dataset": "build_inputs",
-    "WindowSpec": "build_inputs",
-    "LabelSpec": "build_inputs",
-    "BalanceSpec": "build_inputs",
-    "PartitionSpec": "build_inputs",
-    "RowSource": "build_inputs",
-    "HaplotypeCountRowSource": "build_inputs",
-    "MultiTissuePeakRowSource": "build_inputs",
+    "build_dataset": "data.build_inputs",
+    "WindowSpec": "data.build_inputs",
+    "LabelSpec": "data.build_inputs",
+    "BalanceSpec": "data.build_inputs",
+    "PartitionSpec": "data.build_inputs",
+    "RowSource": "data.build_inputs",
+    "HaplotypeCountRowSource": "data.build_inputs",
+    "MultiTissuePeakRowSource": "data.build_inputs",
     # config-driven runner
-    "run_from_config": "build_experiment",
-    "load_config": "build_experiment",
+    "run_from_config": "data.build_experiment",
+    "load_config": "data.build_experiment",
     # personal genomes
-    "PersonalGenome": "personal_seq",
-    "parse_chain_file": "personal_seq",
+    "PersonalGenome": "data.personal_seq",
+    "parse_chain_file": "data.personal_seq",
     # model + scoring
-    "entexBERT2ForSequencePrediction": "model",
-    "load_model_and_tokenizer": "model_io",
-    "run_inference": "model_io",
-    "build_windows": "eval_utils",
-    "load_hetsnv": "eval_utils",
+    "FunctionalFinetuneForSequencePrediction": "trunk.model",
+    "load_model_and_tokenizer": "loading",
+    "run_inference": "loading",
+    "build_windows": "scoring.stats",
+    "load_hetsnv": "scoring.stats",
 }
 
 __all__ = sorted(_EXPORTS) + ["__version__"]

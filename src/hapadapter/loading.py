@@ -3,6 +3,7 @@
 hapadapter.loading -- load any HapAdapter checkpoint
 """
 import re
+import os
 import torch
 import numpy as np
 
@@ -58,9 +59,28 @@ def _head_from_weights(head_sd, pool_dropout: float) -> HapAdapterHead:
     head.load_state_dict(head_sd, strict=True)
     return head
 
+def _trunk_src(run_config: dict, checkpoint_dir: str) -> str:
+    """The trunk directory a head-only checkpoint was fitted on"""
+    src = run_config.get("init_backbone_from")
+    if not src:
+        raise ValueError(
+            f"{checkpoint_dir}/run_config.json says checkpoint_kind='head_only' but records no "
+            f"'init_backbone_from', so the encoder it was fitted on cannot be identified. A "
+            f"head-only checkpoint is unusable without it.")
+    if not os.path.isdir(src):
+        raise ValueError(
+            f"{checkpoint_dir} is head-only and names its trunk as\n  {src}\n"
+            f"which does not exist. Fix the reference or pass "
+            f"overrides={{'init_backbone_from': '<trunk>'}}.")
+    return src
+
 def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides: dict = None):
     """Returns (model, tokenizer, run_config) for either checkpoint shape"""
     run_config = apply_overrides(load_run_config(checkpoint_dir), overrides or {})
+
+    if run_config.get("checkpoint_kind") == "head_only":
+        run_config = {**load_run_config(_trunk_src(run_config, checkpoint_dir)), **run_config}
+
     weights = find_weights_file(checkpoint_dir)
     state_dict = _load_state_dict(weights)
     tokenizer = load_tokenizer(run_config)
@@ -74,19 +94,46 @@ def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides
     # contrast checkpoint: encoder trunk + HapAdapter head
     encoder = build_model(dict(run_config, task="regression", num_labels=1), device=device)
     bb = {k: v for k, v in state_dict.items() if k.split(".")[0] == "backbone"}
-    if not bb:
-        raise ValueError(
-            f"{weights} has a HapAdapter twin contrast head but no backbone.* weights. "
-            f"A head-only checkpoint needs its backbone named in run_config['init_backbone_from']."
-        )
-
-    enc_missing, _ = encoder.load_state_dict(bb, strict=False)
-    still = [k for k in enc_missing if k.split(".")[0] == "backbone"]
-    if still:
-        raise RuntimeError(
-            f"{len(still)} backbone tensors did not load ({still[:4]}...). The checkpoint and "
-            f"the run_config architecture disagree. Refusing to score on a partly random encoder."
-        )
+    if bb:
+        # encoder weights explicitly travel (frozen) with the head
+        enc_missing, _ = encoder.load_state_dict(bb, strict=False)
+        still = [k for k in enc_missing if k.split(".")[0] == "backbone"]
+        if still:
+            raise RuntimeError(
+                f"{len(still)} backbone tensors did not load ({still[:4]}...). The checkpoint "
+                f"and the run_config architecture disagree. Refusing to score on a partly "
+                f"random encoder!"
+            )
+    else:
+        # head-only checkpoint, encoder from init_backbone_from
+        src = _trunk_src(run_config, checkpoint_dir)
+        tw = find_weights_file(src)
+        tsd = _load_state_dict(tw)
+        tbb = {k: v for k, v in tsd.items() if k.split(".")[0] == "backbone"}
+        if not tbb:
+            raise ValueError(
+                f"{weights} is a head-only checkpoint whose init_backbone_from points at\n"
+                f"  {src}\n"
+                f"but {tw} carries no backbone.* weights either -- that is not a trunk!"
+            )
+        enc_missing, _ = encoder.load_state_dict(tbb, strict=False)
+        still = [k for k in enc_missing if k.split(".")[0] == "backbone"]
+        if still:
+            raise RuntimeError(
+                f"{len(still)} backbone tensors from {tw} did not load ({still[:4]}...). The "
+                f"head was fitted on a trunk whose architecture differs from the one that "
+                f"config describes. Refusing to score on a partly random encoder!"
+            )
+        fp = run_config.get("backbone_fingerprint")
+        if fp:
+            from hapadapter.adapter.train import backbone_fingerprint
+            got = backbone_fingerprint(encoder)
+            if got != fp:
+                raise RuntimeError(
+                    f"backbone fingerprint mismatch: the head records {fp!r} but the trunk at\n"
+                    f"  {src}\nhashes to {got!r}.\n"
+                    f"  The trunk has been RETRAINED OR OVERWRITTEN since this head was fitted!"
+                )
 
     head_sd = {k: v for k, v in state_dict.items()
                if k.split(".")[0] in ("proj", "dist_a", "dist_b")}

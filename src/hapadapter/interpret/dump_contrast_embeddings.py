@@ -16,13 +16,108 @@ OR an ASB-windows CSV (sequence1, sequence2, as_label, total_reads, chr, anchor)
 
 File written by Amy Metrick in collaboration with Anthropic's Claude Science Opus 5 Agent
 """
-import argparse, csv, sys
+import argparse, csv, os, sys
 import numpy as np
+
+def _write_npz(out_path, *, labels, ell, trunk_contrast, head_contrast, total_reads,
+               chrom, anchor, checkpoint_dir, data_csv, extra):
+    np.savez_compressed(
+        out_path,
+        labels=np.asarray(labels).astype(np.int8),
+        ell=np.asarray(ell, dtype=np.float32),
+        trunk_contrast=np.asarray(trunk_contrast, dtype=np.float32),
+        head_contrast=np.asarray(head_contrast, dtype=np.float32),
+        trunk_norm=np.linalg.norm(trunk_contrast, axis=1).astype(np.float32),
+        head_norm=np.linalg.norm(head_contrast, axis=1).astype(np.float32),
+        total_reads=np.asarray(total_reads, dtype=np.float32),
+        chrom=np.asarray(chrom),
+        anchor=np.asarray(anchor),
+        checkpoint_dir=np.array(checkpoint_dir),
+        data_csv=np.array(data_csv),
+        **extra,
+    )
+    print(f"[write] {out_path}")
+
+def _cached(args):
+    """For the cached backend"""
+    import json
+    import os
+    import torch
+    from hapadapter.adapter.head import HapAdapterHead
+    from hapadapter.fit_adapter import load_cached_split
+    from hapadapter.trunk.loading import find_weights_file, _load_state_dict
+
+    cfg = json.load(open(os.path.join(args.checkpoint_dir, "run_config.json")))
+    if cfg.get("head_variant") != "twin":
+        raise SystemExit(
+            f"{args.checkpoint_dir} is a {cfg.get('head_variant')!r} head. "
+            f"Only pass twin (contrast) heads here.")
+
+    xf = cfg.get("cache_transform")
+    if xf is None:
+        raise SystemExit(
+            f"{args.checkpoint_dir}/run_config.json records no 'cache_transform', so the "
+            f"embedding preprocessing used at fit time cannot be reproduced. Pass "
+            f"--cache_transform explicitly if you know what the fit used.")
+    if args.cache_transform:
+        xf = args.cache_transform
+
+    split = load_cached_split(args.cache, args.pair_csv, args.meta_csv, args.label_col,
+                              "depth", "depth", xf, "dump", 0.0)
+
+    if cfg.get("d_in") and split["D"] != cfg["d_in"]:
+        raise SystemExit(
+            f"cache width {split['D']} != the head's d_in {cfg['d_in']}. This cache came from "
+            f"a different backbone, or a different pooling mode of the same one.")
+
+    import inspect
+    accepted = set(inspect.signature(HapAdapterHead.__init__).parameters) - {"self"}
+    head = HapAdapterHead(**{k: v for k, v in cfg.items() if k in accepted})
+    head.load_state_dict(_load_state_dict(find_weights_file(args.checkpoint_dir)), strict=True)
+    head.eval()
+
+    h1 = torch.as_tensor(split["h1"], dtype=torch.float32)
+    h2 = torch.as_tensor(split["h2"], dtype=torch.float32)
+
+    with torch.no_grad():
+        ell = head(h1, h2).numpy()
+        head_contrast = (head.proj(h1) - head.proj(h2)).numpy()
+    trunk_contrast = (h1 - h2).numpy()
+
+    extra = {}
+    sd = head.state_dict()
+    if "dist_a" in sd and "dist_b" in sd:
+        a_raw = float(sd["dist_a"].reshape(-1)[0]); b = float(sd["dist_b"].reshape(-1)[0])
+        a = float(torch.nn.functional.softplus(torch.tensor(a_raw)))
+        extra = {"a_raw": np.float32(a_raw), "a": np.float32(a), "b": np.float32(b)}
+        print(f"[dump] head scalars: a_raw={a_raw:.4g} -> a={a:.4g} | b={b:.4g} "
+              f"| decision radius -b/a={-b / a:.4g}")
+
+    y = (split["y"] > 0.5).astype(int)
+    print(f"[dump] cached backend | {len(y)} loci | pos={int(y.sum())} "
+          f"neg={int((y == 0).sum())} | d_in={split['D']} transform={xf}")
+    return dict(labels=y, ell=ell, trunk_contrast=trunk_contrast,
+                head_contrast=head_contrast,
+                total_reads=(split["cov"] if split["cov"] is not None
+                             else np.zeros(len(y), dtype=np.float32)),
+                chrom=split["chrom"], anchor=split["pos"],
+                checkpoint_dir=args.checkpoint_dir, data_csv=args.pair_csv, extra=extra)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint_dir", required=True, help="trained classification Stage-2 run directory")
-    ap.add_argument("--data_csv", required=True, help="Stage-2 build CSV (sequence1,sequence2,label)")
+    ap.add_argument("--backend", choices=["sequence", "cached"], default="sequence",
+                    help="sequence: forward the haplotype pairs through the trunk+head (needs "
+                         "a torch encoder). cached: read the pooled vectors "
+                         "from an embedding cache and apply only the head.")
+    ap.add_argument("--checkpoint_dir", required=True, help="trained classification run directory")
+    ap.add_argument("--data_csv", help="sequence backend: build CSV (sequence1,sequence2,label)")
+    ap.add_argument("--cache", help="cached backend: the embedding cache npz")
+    ap.add_argument("--pair_csv", help="cached backend: the split's pair CSV (labels)")
+    ap.add_argument("--meta_csv", help="cached backend: the split's meta CSV (coordinates)")
+    ap.add_argument("--cache_transform", default=None,
+                    help="cached backend: override the transform recorded in the head's "
+                         "run_config. Only pass this if you know the fit used something else; "
+                         "the recorded value is the one the head was trained under.")
     ap.add_argument("--out", required=True, help="output .npz")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--batch_size", type=int, default=64)
@@ -34,6 +129,18 @@ def main():
     ap.add_argument("--label_col", default="label",
                     help="label column; numeric (e.g. 0.5 for '> 0.5 => positive') OR categorical AS/nonAS (as_label)")
     args = ap.parse_args()
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+
+    if args.backend == "cached":
+        missing = [f"--{f}" for f in ("cache", "pair_csv", "meta_csv")
+                   if not getattr(args, f)]
+        if missing:
+            raise SystemExit(f"--backend cached needs {', '.join(missing)}")
+        _write_npz(args.out, **_cached(args))
+        return
+    if not args.data_csv:
+        raise SystemExit("--backend sequence needs --data_csv")
 
     from hapadapter.loading import run_inference
 
@@ -114,39 +221,26 @@ def main():
     # Stash the trained logistic-link scalars a > 0 and b for plotting
     extra = {}
     try:
-        import torch, os, glob
-        sd_path = os.path.join(args.checkpoint_dir, "pytorch_model.bin")
-        if not os.path.exists(sd_path):
-            cands = glob.glob(os.path.join(args.checkpoint_dir, "*.bin"))
-            sd_path = cands[0] if cands else None
-        if sd_path:
-            sd = torch.load(sd_path, map_location="cpu")
-            if "dist_a" in sd and "dist_b" in sd:
-                a_raw = float(sd["dist_a"].reshape(-1)[0])
-                b = float(sd["dist_b"].reshape(-1)[0])
-                a = float(torch.nn.functional.softplus(torch.tensor(a_raw)))
-                extra = {"a_raw": np.float32(a_raw), "a": np.float32(a), "b": np.float32(b)}
-                print(f"[dump] head scalars: a_raw={a_raw:.4g} -> a={a:.4g} | b={b:.4g} "
-                      f"| decision radius -b/a={-b/a:.4g}")
+        import torch
+        from hapadapter.trunk.loading import find_weights_file, _load_state_dict
+        sd = _load_state_dict(find_weights_file(args.checkpoint_dir))
+        if "dist_a" in sd and "dist_b" in sd:
+            a_raw = float(sd["dist_a"].reshape(-1)[0])
+            b = float(sd["dist_b"].reshape(-1)[0])
+            a = float(torch.nn.functional.softplus(torch.tensor(a_raw)))
+            extra = {"a_raw": np.float32(a_raw), "a": np.float32(a), "b": np.float32(b)}
+            print(f"[dump] head scalars: a_raw={a_raw:.4g} -> a={a:.4g} | b={b:.4g} "
+                  f"| decision radius -b/a={-b/a:.4g}")
+        else:
+            print(f"[dump] no dist_a/dist_b in the checkpoint: this is a single-variant head, "
+                  f"which has no distance scalars to read.")
     except Exception as e:
         print(f"[dump] could not read a/b from checkpoint ({e}); plot will need --a_raw/--b")
 
-    np.savez_compressed(
-        args.out,
-        labels=labels.astype(np.int8),
-        ell=logits,
-        trunk_contrast=trunk_contrast,
-        head_contrast=head_contrast,
-        trunk_norm=np.linalg.norm(trunk_contrast, axis=1).astype(np.float32),
-        head_norm=np.linalg.norm(head_contrast, axis=1).astype(np.float32),
-        total_reads=total_reads,
-        chrom=chrom,
-        anchor=anchor,
-        checkpoint_dir=np.array(args.checkpoint_dir),
-        data_csv=np.array(args.data_csv),
-        **extra,
-    )
-    print(f"[write] {args.out}")
+    _write_npz(args.out, labels=labels, ell=logits, trunk_contrast=trunk_contrast,
+               head_contrast=head_contrast, total_reads=total_reads, chrom=chrom,
+               anchor=anchor, checkpoint_dir=args.checkpoint_dir, data_csv=args.data_csv,
+               extra=extra)
 
 if __name__ == "__main__":
     main()
