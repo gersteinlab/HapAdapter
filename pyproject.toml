@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hapadapter"
 version = "0.1.0"
-description = "Two-stage transfer learning in a DNA transformer for predicting allele-specific behavior, built on a modified DNABERT-2 backbone"
+description = "A transfer learning protocol for genomic foundation models adapted to diploid personal epigenomes"
 authors = [
   {name = "Amy Metrick"},
 ]
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.8"
-keywords = ["genomics", "allele-specific binding", "DNABERT", "EN-TEx", "transfer learning"]
+keywords = ["genomic foundation models", "allele-specific binding", "DNABERT", "EN-TEx", "transfer learning"]
 classifiers = [
   "Intended Audience :: Science/Research",
   "Topic :: Scientific/Engineering :: Bio-Informatics",
@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Model definition, training and scoring -- required by hapadapter.model, model_io and finetune_entexbert2
+# model definition, training and scoring
 model = [
   "torch",
   "transformers",
@@ -38,11 +38,15 @@ model = [
   "peft",
 ]
 
-# For analysis and figure scripts under hapadapter.analysis
+# figures and interpretation
 analysis = [
   "matplotlib",
   "logomaker",
   "memelite",
+]
+
+alphagenome = [
+  "alphagenome",
 ]
 
 all = [
@@ -51,15 +55,19 @@ all = [
 ]
 
 [project.urls]
-Repository = "https://github.com/gersteinlab/entexBERT-2"
+Repository = "https://github.com/gersteinlab/HapAdapter"
 
 [project.scripts]
-# `hapadapter-build path/to/config.yaml` == `python -m hapadapter.build_experiment ...`
-hapadapter-build = "hapadapter.build_experiment:main"
+hapadapter-build = "hapadapter.data.build_experiment:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+namespaces = false
 
 [tool.setuptools.package-data]
-# the config.json / tokenizer files of the vendored backbone are data, not modules
-"*" = ["*.json"]
+"hapadapter.backbones" = [
+  "weights/**/*.json",
+  "weights/**/*.py",
+  "weights/**/*.txt",
+  "weights/**/LICENSE",
+]
