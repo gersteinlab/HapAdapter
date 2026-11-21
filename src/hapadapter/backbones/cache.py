@@ -45,6 +45,14 @@ def write_pair_cache(path: str, keys, vals) -> str:
         raise ValueError(f"{len(keys)} keys but {len(vals)} vectors -- these must match!")
     if vals.ndim != 2:
         raise ValueError(f"vals must be (n_windows, D); got shape {vals.shape}.")
+    
+    uniq, counts = np.unique(keys, return_counts=True)
+    if len(uniq) != len(keys):
+        dupes = uniq[counts > 1]
+        raise ValueError(
+            f"{len(keys) - len(uniq)} duplicate key(s) among {len(keys)}, e.g. "
+            f"{list(dupes[:3])}.")
+
     out = path if path.endswith(".npz") else path + ".npz"
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     tmp = out[:-4] + ".tmp.npz"
@@ -59,7 +67,7 @@ def load_pair_cache(path: str, chrom, pos, transform: str = "auto", tag: str = "
     Returns dict(h1, h2, ok, D, transform)
 
     `chrom` and `pos`: the locus list to score
-    ** Loci absent from the cache come back as zero rows with ok=False -- filter on `ok` before fitting **
+    ** loci absent from the cache come back as zero rows with ok=False -- filter on `ok` before fitting **
 
     transform = 'auto' picks none for a matrix with negative entries and log1p otherwise
     """
@@ -105,7 +113,7 @@ def load_pair_cache(path: str, chrom, pos, transform: str = "auto", tag: str = "
             f"which loci the result describes. Pass min_ok_frac=0 to proceed deliberately."
         )
 
-    neg = min(float(h1[ok].min()), float(h2[ok].min()))
+    neg = float(vals.min())
     xf = transform
     if xf == "auto":
         xf = "none" if neg < -1e-6 else "log1p"
