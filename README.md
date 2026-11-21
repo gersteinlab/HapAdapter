@@ -1,5 +1,5 @@
-# entexBERT-2
-### **Two-stage** transfer learning with a **DNA transformer** for predicting **allele-specific activity**
+# HapAdapter
+### A Transfer Learning Protocol for Genomic Foundation Models Adapted to Diploid Personal Epigenomes
 
 built on a modified DNABERT-2 backbone and trained on EN-TEx allele-specific read counts.
 

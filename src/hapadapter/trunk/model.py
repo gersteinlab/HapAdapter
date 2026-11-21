@@ -6,13 +6,14 @@ Encoder -> pooled representation -> prediction head
 
   * task="regression": mu = head(pool(seq))
         - One window -> one score
-        - MSE, optionally precision-weighted by depth
         - Single-track (scalar) or multi-track (one score per tissue)
+        - MSE, optionally precision-weighted by depth (for single-track only)
 
   * task="classification": ell = head(pool(seq))
         - One window -> one logit
         - BCE, optionally precision-weighted
 """
+import warnings
 from typing import Optional
 
 import torch
@@ -21,7 +22,6 @@ from transformers.modeling_outputs import SequenceClassifierOutput
 
 from hapadapter.model_utils import (
     build_prediction_head,
-    get_activation_module,
     neff_weight,
 )
 
@@ -69,8 +69,9 @@ class FunctionalFinetuneForSequencePrediction(torch.nn.Module):
         self.neff_s = float(neff_s)
         self.task = task
         self.num_labels = num_labels
+        self._warned_multitrack_depth = False
     
-        # Pretrained encoder (any HF AutoModel with a tokenizer that emits input_ids)
+        # pretrained encoder (any HF AutoModel with a tokenizer that emits input_ids)
         self.backbone = transformers.AutoModel.from_pretrained(
             model_name_or_path, cache_dir=cache_dir, trust_remote_code=True,
         )
@@ -96,7 +97,7 @@ class FunctionalFinetuneForSequencePrediction(torch.nn.Module):
         (defaults to False because the intended use is transferring 
         a conditioned encoder to a NEW task, whose head must start fresh)
         """
-        sd = torch.load(checkpoint_path, map_location=map_location)
+        sd = torch.load(checkpoint_path, map_location=map_location, weights_only=True)
         
         if isinstance(sd, dict) and "state_dict" in sd and "backbone.embeddings" not in str(sd.keys()):
             sd = sd["state_dict"]
@@ -120,6 +121,17 @@ class FunctionalFinetuneForSequencePrediction(torch.nn.Module):
         # 'unexpected' should be empty
         if unexpected:
             raise ValueError(f"Unexpected keys while loading backbone: {unexpected[:5]} ...")
+        
+        # ensure every backbone tensor comes from the supplied checkpoint
+        still_backbone = [k for k in missing if k.startswith("backbone.")]
+        if still_backbone:
+            raise ValueError(
+                f"{len(still_backbone)} of {len(still_backbone) + sum(k.startswith('backbone.') for k in backbone_sd)} "
+                f"backbone tensors were NOT in {checkpoint_path}, e.g. {still_backbone[:4]}. "
+                f"Those parameters would keep their pretrained values, so the encoder would be "
+                f"only partly transferred. Check that the checkpoint came from the same encoder "
+                f"architecture.")
+        
         if include_head:
             still = [k for k in missing if k.startswith("main_head.")]
             if still:
@@ -191,10 +203,8 @@ class FunctionalFinetuneForSequencePrediction(torch.nn.Module):
 
     def forward(
         self,
-        input_ids=None,            # hap1 window (sequence1)
+        input_ids=None,            # single window for trunk
         attention_mask=None,
-        input_ids_alt=None,        # hap2 window (sequence2)
-        attention_mask_alt=None,
         labels=None,               # regression: binding label, (B,) scalar or (B,T) per-track; classification: 0/1
         depth=None,                # n = depth (privileged; weight only)
         label_mask=None,           # (B,T) 0/1 observed mask for multi-track targets (no mask => all observed)
@@ -213,8 +223,14 @@ class FunctionalFinetuneForSequencePrediction(torch.nn.Module):
         # regression: single-window functional score
         mu, _ = self._score_one(input_ids, attention_mask, **kwargs) # (B,) or (B,T)
 
-        # multi-track (num_labels > 1): masked multi-output MSE over observed tissues
+        # multi-track (num_labels > 1): masked multi-output MSE over observed tissues, no precision weighting
         if self.num_labels > 1:
+            if depth is not None and not self._warned_multitrack_depth:
+                warnings.warn(
+                    "multi-track regression (num_labels > 1) does not enable precision-weighted loss. "
+                    "--n_eff.s argument entered will be recorded but ignored.",
+                    RuntimeWarning, stacklevel=2)
+                self._warned_multitrack_depth = True
             loss = None
             if labels is not None:
                 y = labels.float().view_as(mu)
