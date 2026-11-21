@@ -134,15 +134,26 @@ def main():
         print(f"[resume] {len(done) // 2} loci already cached -> {len(keep)} of {len(rows)} "
               f"left in this shard")
         rows = np.array(keep, dtype=int)
-    keys = [k for k in (existing[a.out[0]][0] if existing else [])]
-    vals = {m: ([existing[p][1]] if existing else [])
-            for m, p in zip(a.pool, a.out)}
+
+    keys, vals = [], {m: [] for m in a.pool}
     if existing:
-        # re-key every mode off ONE order so a flush cannot interleave them differently
-        order = {k: i for i, k in enumerate(existing[a.out[0]][0])}
-        for m, p in zip(a.pool, a.out):
-            ks, vs = existing[p]
-            vals[m] = [vs[np.array([order[k] for k in ks])]] if ks else []
+        # complete loci only
+        base = existing[a.out[0]][0]
+        have = set(base)
+        keep_j = [j for j, k in enumerate(base)
+                  if all(f"{k.rsplit(':', 1)[0]}:{t}" in have for t in ("h1", "h2"))]
+        if len(keep_j) != len(base):
+            print(f"[resume] dropped {len(base) - len(keep_j)} single haplotype row(s) from "
+                  f"{os.path.basename(a.out[0])}; those loci are recomputed")
+        keys = [base[j] for j in keep_j]
+        # re-key every mode off one order so a flush cannot interleave them differently
+        order = {k: i for i, k in enumerate(base)}
+        for m, pth in zip(a.pool, a.out):
+            ks, vs = existing[pth]
+            if not ks:
+                continue
+            idx = np.array([order[k] for k in ks])
+            vals[m] = [vs[np.argsort(idx)][keep_j]]
 
     seq_len = len(str(df["sequence1"].iloc[0]))
     n_fwd = 2 * len(rows)
@@ -187,9 +198,10 @@ def main():
                 info[mode] = (eff_bp, src)
             keys.append(pair_key(meta[cc].iloc[i], meta[pc].iloc[i], tag))
             done_n += 1
-            if a.flush_every and done_n % a.flush_every == 0:
-                flush()
-                print(f"[flush] {len(keys) // 2} loci written", flush=True)
+        # flush after BOTH haplotypes go through forward
+        if a.flush_every and done_n % (2 * a.flush_every) < 2:
+            flush()
+            print(f"[flush] {len(keys) // 2} loci written", flush=True)
         if done_n % 200 == 0:
             el = time.time() - t0
             print(f"[fwd] {done_n}/{n_fwd} | {el / done_n:.3f} s/forward | "
