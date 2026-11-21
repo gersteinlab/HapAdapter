@@ -7,7 +7,6 @@ import torch
 
 from hapadapter.model_utils import (
     build_prediction_head,
-    get_activation_module,
     neff_weight,
 )
 
@@ -24,8 +23,9 @@ def build_head_modules(
     head_activation: str = "gelu",
     head_dropout: float = 0.1,
 ) -> dict:
-    if head_variant not in ("twin", "single"):
-        raise ValueError(f"head_variant must be 'twin' or 'single', got {head_variant!r}.")
+    if head_variant != "twin":
+        raise ValueError(
+            f"head_variant must be 'twin', got {head_variant!r}.")
     
     if num_labels != 1:
         raise ValueError(
@@ -33,20 +33,8 @@ def build_head_modules(
             f"{num_labels} is not supported."
         )
 
-    head_modules = dict(main_head=None, proj=None, dist_a=None, dist_b=None)
+    head_modules = dict(proj=None, dist_a=None, dist_b=None)
 
-    if head_variant == "single":
-        head_modules["main_head"] = build_prediction_head(
-            input_size=d_in,
-            output_size=1,
-            num_layers=head_num_layers,
-            hidden_size=head_hidden_size,
-            activation=head_activation,
-            dropout=head_dropout,
-        )
-        return head_modules
-
-    # else: twin
     if proj_dim <= 0:
         raise ValueError(f"proj_dim must be > 0 for the twin head, got {proj_dim}.")
     
@@ -105,12 +93,9 @@ class HapAdapterHead(torch.nn.Module):
 
     def forward(self, h1, h2=None):
         """h1, h2 are pooled haplotype embeddings with shape (B, d_in)"""
-        if self.head_variant == "twin":
-            if h2 is None:
-                raise RuntimeError("the twin head needs both haplotypes (got h2=None).")
-            return twin_logit(self.proj, self.dist_a, self.dist_b, self.dropout, h1, h2)
-        out = self.main_head(self.dropout(h1))
-        return out.squeeze(-1) if out.shape[-1] == 1 else out
+        if h2 is None:
+            raise RuntimeError("the twin head needs both haplotypes (got h2=None).")
+        return twin_logit(self.proj, self.dist_a, self.dist_b, self.dropout, h1, h2)
 
     def config(self) -> dict:
         """Everything needed to rebuild an instantiation of the HapAdapter head"""
