@@ -7,7 +7,7 @@ hapadapter.trunk.loading -- encoder trunk I/O
 import glob
 import json
 import os
-from typing import Optional
+import warnings
 
 import torch
 import transformers
@@ -66,6 +66,12 @@ def find_weights_file(checkpoint_dir: str) -> str:
         for name in ("pytorch_model.bin", "model.safetensors"):
             c = os.path.join(ckpt, name)
             if os.path.exists(c):
+                warnings.warn(
+                    f"{checkpoint_dir} has no top-level pytorch_model.bin / model.safetensors; "
+                    f"falling back to the mid-training checkpoint {os.path.basename(ckpt)}. "
+                    f"This is NOT the best-on-dev model -- it is whatever the last saved step "
+                    f"held. Re-run with load_best_model_at_end, or pass the weights explicitly.",
+                    RuntimeWarning, stacklevel=2)
                 return c
 
     raise FileNotFoundError(
@@ -79,7 +85,7 @@ def _load_state_dict(weights_path: str) -> dict:
         from safetensors.torch import load_file
         return load_file(weights_path)
     # pytorch_model.bin
-    return torch.load(weights_path, map_location="cpu")
+    return torch.load(weights_path, map_location="cpu", weights_only=True)
 
 def load_model_weights(model: torch.nn.Module, weights_path: str) -> torch.nn.Module:
     """Load a state dict into model, reporting missing/unexpected keys"""
@@ -115,6 +121,16 @@ def load_model_weights(model: torch.nn.Module, weights_path: str) -> torch.nn.Mo
             f"run_config architecture likely disagree. Refusing to run on an untrained head!"
         )
 
+    if any(k.startswith("backbone.") for k in model.state_dict()):
+        bb_missing = [k for k in missing if k.split(".")[0] == "backbone"]
+        if bb_missing:
+            raise RuntimeError(
+                f"{len(bb_missing)} backbone tensors did not load from {weights_path} "
+                f"({bb_missing[:4]}...). Those parameters keep the values AutoModel.from_pretrained "
+                f"gave them, so this would score a pretrained encoder under a fine-tuned head. "
+                f"Refusing to run on a partly pretrained encoder!"
+            )
+
     return model
 
 # ---------------------------------------------------------------------------
@@ -128,6 +144,14 @@ def build_model(run_config: dict, device: str = "cpu") -> torch.nn.Module:
             "run_config has use_lora=True, but LoRA checkpoints are not handled by the current "
             "version of this codebase."
         )
+
+    _required = ("model_name_or_path", "pooling_mode", "head_num_layers", "head_hidden_size")
+    _absent = [k for k in _required if k not in run_config]
+    if _absent:
+        raise KeyError(
+            f"run_config.json is missing {_absent}, which define the architecture this "
+            f"checkpoint's weights were trained into. Pass them via overrides, or point at a "
+            f"run_config written by a current trainer.")
 
     head_num_layers = run_config["head_num_layers"]
     if head_num_layers >= 2 and "head_activation" not in run_config:
