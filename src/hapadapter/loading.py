@@ -22,18 +22,18 @@ from hapadapter.trunk.loading import (
 def _head_kind(state_dict) -> str:
     roots = {k.split(".")[0] for k in state_dict}
     if "proj" in roots or "dist_a" in roots:
-        return "contrast"
+        return "adapter"
     if "main_head" in roots:
-        return "single_window"
+        return "trunk"
     raise ValueError(
-        f"checkpoint has neither proj/dist_a (contrast head) nor main_head (single-window "
-        f"readout); top-level keys are {sorted(roots)[:8]}. Refusing to guess which it is!"
+        f"checkpoint has neither proj/dist_a (HapAdapter head) nor main_head (trunk "
+        f"only); top-level keys are {sorted(roots)[:8]}. Refusing to guess which it is!"
     )
 
+def _head_from_weights(head_sd, pool_dropout: float, run_config: dict = None) -> HapAdapterHead:
+    """Rebuild a HapAdapter twin contrast head from its weights and run config"""
+    rc = run_config or {}
 
-
-def _head_from_weights(head_sd, pool_dropout: float) -> HapAdapterHead:
-    """Rebuild a HapAdapter twin contrast head from its weights"""
     def _idx(k):
         m = re.search(r"\.(\d+)\.weight$", k)
         return int(m.group(1)) if m else -1
@@ -53,6 +53,8 @@ def _head_from_weights(head_sd, pool_dropout: float) -> HapAdapterHead:
         proj_dim=int(proj_dim),
         head_num_layers=n_layers,
         head_hidden_size=int(head_sd[lin[0]].shape[0]) if n_layers > 1 else -1,
+        head_activation=rc.get("head_activation", "gelu"),
+        head_dropout=float(rc.get("head_dropout", 0.1)),
         pool_dropout=pool_dropout,
     )
 
@@ -85,7 +87,7 @@ def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides
     state_dict = _load_state_dict(weights)
     tokenizer = load_tokenizer(run_config)
 
-    if _head_kind(state_dict) == "single_window":
+    if _head_kind(state_dict) == "trunk":
         model = build_model(run_config, device=device)
         load_model_weights(model, weights)
         model.eval()
@@ -137,7 +139,10 @@ def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides
 
     head_sd = {k: v for k, v in state_dict.items()
                if k.split(".")[0] in ("proj", "dist_a", "dist_b")}
-    head = _head_from_weights(head_sd, pool_dropout=float(encoder.dropout.p))
+
+    head = _head_from_weights(
+        head_sd, run_config=run_config,
+        pool_dropout=float(run_config.get("pool_dropout", encoder.dropout.p)))
 
     from hapadapter.adapter.train import HapAdapterForPairedPrediction
     model = HapAdapterForPairedPrediction(encoder, head, neff_s=run_config.get("neff_s", 20.0)).to(device)
