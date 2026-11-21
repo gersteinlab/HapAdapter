@@ -44,6 +44,7 @@ import os
 import re
 import sys
 
+import matplotlib as mpl
 import numpy as np
 
 #: Class colours, matched to the earlier contrast figures so rows cut from this script and
@@ -158,63 +159,176 @@ def ecdf(ax, val, y, title, xlabel, colors=None, logx="auto", vline=None, vlabel
         ax.plot([], [], " ", label=vlabel)
     ax.set_xlabel(xlabel, fontsize=fs)
     ax.set_ylabel("Cumulative fraction", fontsize=fs)
-    # The class medians and the exact decision radius are NOT printed on the figure: they go
-    # to --csv_out and belong in the caption. A title carrying three numbers is read as a
-    # label rather than read for its numbers, and the AUROC is the one that earns the space.
-    ax.set_title(f"{title}\nAUROC = {au:.3f}", fontsize=fs)
+    # NO NUMBERS ON THIS FIGURE AT ALL. Its claim is that the two classes SEPARATE, which the
+    # curves show directly; an AUROC printed beside them invites reading it as a performance
+    # result, and these are plain (unmatched) AUROCs that carry the read-depth confound --
+    # the one number here that should not travel on an image. Every AUROC is still computed
+    # and still written to --csv_out, so the caption can quote whichever is defensible.
+    ax.set_title(title, fontsize=fs)
     ax.legend(loc="upper left", frameon=False, fontsize=fs - 1)
     ax.grid(alpha=0.25, which="both")
     ax.tick_params(labelsize=fs - 1)
     return au, float(np.median(val[y == 1])), float(np.median(val[y == 0]))
 
 
-def ell_hist(ax, ell, y, row_label, colors=None, fs=8):
-    lo, hi = np.percentile(ell, [0.5, 99.5])
-    bins = np.linspace(lo, hi, 45)
+def ell_hist(ax, ell, y, row_label, colors=None, fs=8, clip_q=99.5, nbins=45,
+             mode="distance", dist=None, radius=None, xlabel=None):
+    """
+    Head-logit density. Returns (auroc, kept_fraction, hi).
+
+    THE BINS ARE COMPUTED OVER THE CLIPPED RANGE, NOT JUST THE AXIS LIMIT. The AS logit has a
+    long right tail -- a handful of loci reach +17 while the bulk sits inside [-1, 1] -- so a
+    range set by the full extent spends 45 bins on mostly-empty space and the separation near
+    the boundary renders as two or three bars. Setting xlim alone would not fix that: the bin
+    WIDTH is what hides the structure, and it is chosen here. Binning inside the clipped range
+    puts all 45 bins where the classes actually differ.
+
+    WHAT CLIPPING COSTS, AND WHY IT IS ACCEPTABLE HERE. Mass beyond `hi` is dropped from the
+    drawn histogram, so the visible bars no longer integrate to 1 and the two classes are
+    clipped by DIFFERENT amounts (the tail is almost entirely AS). The figure's claim is that
+    the classes separate, and discarding part of the AS tail makes that claim HARDER to see,
+    not easier -- the clipped loci are the most confidently-AS ones. The kept fraction is
+    returned, printed and written to --csv_out so the caption can state it rather than a reader
+    having to infer it from a truncated axis.
+    """
+    # COORDINATE, NOT ZOOM. For a twin head ell = a*||P(h1) - P(h2)|| + b with a > 0, i.e. a
+    # strictly monotone LINEAR map of a non-negative, heavily right-skewed distance. A linear
+    # axis therefore always piles the mass against the floor b and strings a thin tail to the
+    # right, and no choice of clip percentile fixes that -- clipping moves the right edge, it
+    # does not change the skew. Column 3 already handles the same skew with a log axis, so in
+    # "distance" mode this panel is drawn in the SAME coordinate as column 3: log-x on
+    # ||P(h1) - P(h2)||, with the decision RADIUS -b/a where the boundary was. No information
+    # is lost -- the map is monotone, so the AUROC is identical either way -- and the two
+    # right-hand panels become the ECDF/density pair that columns 1 and 2 already are.
+    radius_offscale = False
+    use_dist = (mode == "distance") and (dist is not None) and (radius is not None) \
+               and np.all(np.asarray(dist) > 0)
+    if use_dist:
+        val = np.asarray(dist, dtype=float)
+        lo = float(np.percentile(val, 100 - clip_q))
+        hi = float(np.percentile(val, clip_q))
+        # THE AXIS FOLLOWS THE DATA; THE RADIUS IS ANNOTATED IF IT FALLS OUTSIDE. Forcing the
+        # radius onto the axis stretched rows whose threshold sits far above every locus --
+        # row 4 of the real figure had its mass in 1e-3..1e-1 and the radius near 1, so most
+        # of the panel was empty. That the threshold sits off the mass is a genuine finding
+        # (it is why recall at the default threshold is low), so it is reported rather than
+        # dropped -- just not at the cost of making the distributions unreadable.
+        radius_offscale = not (lo <= radius <= hi)
+        bins = np.logspace(np.log10(lo), np.log10(hi), nbins)
+        ax.set_xscale("log")
+        # NO MINOR TICK LABELS. When a log axis spans less than a decade matplotlib starts
+        # labelling the MINOR ticks too ("2 x 10^-1", "3 x 10^-1", ...), and at this panel
+        # width they overprint into an unreadable smear. Suppressing them can leave a decade
+        # with no labelled tick at all, so when fewer than two majors land in range, plain
+        # decimal labels are placed at the ends and the midpoint instead.
+        ax.xaxis.set_minor_formatter(mpl.ticker.NullFormatter())
+        _dec = np.log10(hi) - np.log10(lo)
+        if _dec < 1.05:
+            mid = float(np.sqrt(lo * hi))
+            ax.set_xticks([lo, mid, hi])
+            ax.xaxis.set_major_formatter(
+                mpl.ticker.FuncFormatter(lambda v, _p: f"{v:.3g}"))
+        boundary, blabel = radius, "decision radius"
+        # Inherit the caller's label so --x_norm shows in BOTH head panels, not just column 3.
+        xlab = (xlabel or "Haplotype dissimilarity  ||P(h1) − P(h2)||") + "  (log)"
+    else:
+        val = np.asarray(ell, dtype=float)
+        lo = float(np.percentile(val, 0.5))
+        hi = float(np.percentile(val, clip_q))
+        if not np.isfinite(hi) or hi <= lo:               # degenerate (e.g. a constant logit)
+            lo, hi = float(np.min(val)), float(np.max(val)) or 1.0
+        # The decision boundary must stay on the axis: it is the one annotation that makes this
+        # panel readable, and a clip that excluded it would be a different plot.
+        hi, lo = max(hi, 1e-9), min(lo, -1e-9)
+        bins = np.linspace(lo, hi, nbins)
+        boundary, blabel = 0.0, "decision boundary"
+        xlab = "Model logit  (dashed: decision boundary)"
+    kept = float(np.mean((val >= lo) & (val <= hi)))
     cols = colors or DEFAULT_COLORS
-    ax.hist(ell[y == 0], bins=bins, color=cols["nonas"], alpha=0.55, density=True, label="non-AS")
-    ax.hist(ell[y == 1], bins=bins, color=cols["as"], alpha=0.55, density=True, label="AS")
+    # FRACTION PER BIN ON A LOG AXIS, NOT density=True. density divides each count by its bin
+    # WIDTH, and log-spaced bins differ in width by orders of magnitude -- so the narrow bins
+    # at small x are divided by a tiny number and tower over everything else. That is what put
+    # row 4's y-axis at 80 while its neighbours sat near 1: an artifact of the normalisation,
+    # not a property of the distribution. Weighting by 1/n instead makes every bar "fraction
+    # of this class's loci", comparable left to right and across rows.
+    for cls, key, lab in ((0, "nonas", "non-AS"), (1, "as", "AS")):
+        v = val[y == cls]
+        v = v[(v >= lo) & (v <= hi)]
+        ax.hist(v, bins=bins, color=cols[key], alpha=0.55, label=lab,
+                weights=np.full(len(v), 1.0 / max((y == cls).sum(), 1)))
+    ax.set_xlim(lo, hi)
     # SAME boundary as delta* = -b/a on the head-norm axis, which is why panel 2's dashed line
     # and this one are the same decision, drawn in two coordinate systems.
-    ax.axvline(0.0, color="k", lw=1.2, ls="--", alpha=0.8, label="decision boundary")
+    if use_dist and radius_offscale:
+        side = 0.985 if radius > hi else 0.015
+        ax.annotate(f"{blabel} {radius:.3g} {'→' if radius > hi else '←'}",
+                    xy=(side, 0.97), xycoords="axes fraction",
+                    ha="right" if radius > hi else "left", va="top",
+                    fontsize=fs - 1.5, color="0.35")
+    else:
+        ax.axvline(boundary, color="k", lw=1.2, ls="--", alpha=0.8, label=blabel)
     au = _auroc(y, ell)
-    ax.set_xlabel("Model logit  (dashed: decision boundary)", fontsize=fs)
-    ax.set_ylabel("Density", fontsize=fs)
-    # Short, like its siblings: the row label carries which cell this is.
-    ax.set_title(f"Head logit\nAUROC = {au:.3f}", fontsize=fs)
-    ax.legend(loc="best", frameon=False, fontsize=fs - 1)
+    ax.set_xlabel(xlab, fontsize=fs)
+    ax.set_ylabel("Fraction of loci", fontsize=fs)
+    # Short, like its siblings: the row label carries which cell this is, and the AUROC goes
+    # to --csv_out rather than onto the panel (see the note in ecdf).
+    ax.set_title("Head separation" if use_dist else "Head logit", fontsize=fs)
+    # FRAMED AND OPAQUE, not frameon=False. The decision-radius rule is a vertical line that
+    # loc="best" cannot avoid -- "best" minimises overlap with the DATA, and a single thin line
+    # is cheap to cross, so it routinely draws straight through the entry text. A white backing
+    # fixes legibility without moving the legend off the emptiest corner. This is also the one
+    # collision a text-vs-text overlap check cannot see, since the line is not text.
+    ax.legend(loc="best", frameon=True, framealpha=0.82, edgecolor="none",
+              facecolor="white", fontsize=fs - 1)
     ax.tick_params(labelsize=fs - 1)
-    return au
+    return au, kept, hi
 
 
-def dist_hist(ax, val, y, xlabel, title, colors=None, logx=False, vline=None, fs=8):
+def dist_hist(ax, val, y, xlabel, title, colors=None, logx=False, vline=None, fs=8,
+              clip_q=99.5):
     """
-    Density of a per-locus quantity by class, on shared bins.
+    Density of a per-locus quantity by class, on shared bins. -> (median_AS, median_nonAS, kept)
 
     SHARED BINS, NOT TWO INDEPENDENT HISTOGRAMS. Matplotlib would otherwise choose a different
     edge set per class and the two densities would not be comparable bar-for-bar -- the visual
-    difference between them would partly be a binning difference. The range is clipped to the
-    pooled 0.5-99.5 percentiles for display only, so one long tail cannot compress the body of
-    both distributions into a single bar.
+    difference between them would partly be a binning difference.
+
+    SAME CLIP CONVENTION AS THE HEAD PANEL, which is why clip_q is a parameter rather than the
+    fixed 99.5 it used to be. This panel and the head-logit panel plot DIFFERENT quantities, so
+    their absolute ranges were never comparable -- but when one dropped 0.5% of its tail and
+    the other dropped 15%, the apparent "this panel is zoomed in further" was an artifact of
+    two different conventions rather than a property of the distributions. Dropping the same
+    FRACTION from both makes the two panels in a row read as the same kind of view.
     """
     cols = colors or DEFAULT_COLORS
     val = np.asarray(val, dtype=float)
-    lo, hi = np.percentile(val, [0.5, 99.5])
+    lo, hi = np.percentile(val, [100 - clip_q, clip_q])
+    kept = float(np.mean((val >= lo) & (val <= hi)))
     if logx and lo > 0:
         bins = np.logspace(np.log10(lo), np.log10(hi), 45)
         ax.set_xscale("log")
     else:
         bins = np.linspace(lo, hi, 45)
-    ax.hist(val[y == 0], bins=bins, color=cols["nonas"], alpha=0.55, density=True, label="non-AS")
-    ax.hist(val[y == 1], bins=bins, color=cols["as"], alpha=0.55, density=True, label="AS")
+    # FRACTION PER BIN, NOT density=True -- the same convention as the head panel. A density
+    # divides by bin WIDTH, so its height carries the units of whatever embedding produced it:
+    # AlphaGenome's dissimilarities are ~6x larger than DNABERT-2's, which alone put one row's
+    # y-max at 0.26 and another's at 1.45 with no difference in how peaked they are. A reader
+    # comparing two rows would have been reading a unit conversion. As a fraction, a flat
+    # distribution is 1/nbins in EVERY panel, so height means the same thing in all of them.
+    for _cls, _key, _lab in ((0, "nonas", "non-AS"), (1, "as", "AS")):
+        _v = val[(y == _cls) & (val >= lo) & (val <= hi)]
+        ax.hist(_v, bins=bins, color=cols[_key], alpha=0.55, label=_lab,
+                weights=np.full(len(_v), 1.0 / max((y == _cls).sum(), 1)))
     if vline is not None and vline > 0:
         ax.axvline(vline, color="k", lw=1.2, ls="--", alpha=0.8, label="decision radius")
     ax.set_xlabel(xlabel, fontsize=fs)
-    ax.set_ylabel("Density", fontsize=fs)
+    ax.set_ylabel("Fraction of loci", fontsize=fs)
     ax.set_title(title, fontsize=fs)
-    ax.legend(loc="upper right", frameon=False, fontsize=fs - 1)
+    ax.legend(loc="upper right", frameon=True, framealpha=0.82, edgecolor="none",
+              facecolor="white", fontsize=fs - 1)
+    ax.set_xlim(lo, hi)
     ax.tick_params(labelsize=fs - 1)
-    return float(np.median(val[y == 1])), float(np.median(val[y == 0]))
+    return float(np.median(val[y == 1])), float(np.median(val[y == 0])), kept
 
 
 def median_gain(hnorm, tnorm, y):
@@ -316,6 +430,38 @@ def main():
                          "label at the left names the cell, so everything else -- assay, "
                          "individual, what the dashed lines mean, the medians -- belongs in the "
                          "caption and in --csv_out, not on the image.")
+    ap.add_argument("--logit_clip_pct", default="99.0",
+                    help="percentile of the head logit at which the density panel's x-axis "
+                         "ends, AND over which its bins are computed -- setting only the limit "
+                         "would leave the bin width chosen over the full range, which is what "
+                         "hides the separation. Mass beyond it is dropped from the drawing, "
+                         "almost all of it AS, so the clip makes the separation harder to see "
+                         "rather than easier. 100 disables it. The drawn fraction is printed "
+                         "and written to --csv_out. Accepts ONE value for every row, or a "
+                         "comma-separated value PER row in --row order -- the percentile is "
+                         "evaluated within each row, so one number gives different absolute "
+                         "limits per row and a row whose bulk is narrower needs its own. The "
+                         "SAME percentile governs the backbone-density panel, so both density "
+                         "panels in a row drop the same FRACTION of their tail -- otherwise "
+                         "one looks more zoomed than the other for no reason to do with the "
+                         "data. Their absolute ranges are still incomparable; they plot "
+                         "different quantities.")
+    ap.add_argument("--x_norm", choices=["none", "nonas_median"], default="none",
+                    help="divide each row's dissimilarity axes by that row's NON-AS median, so "
+                         "every row reads in units of a typical non-AS locus and the rows are "
+                         "comparable left to right. AUROC, the standardised gain and the ECDF "
+                         "shapes are invariant to a positive scale, so only the axis changes; "
+                         "the divisors are written to --csv_out. Without it the two backbones' "
+                         "axes are in different units and the caption has to say so.")
+    ap.add_argument("--head_density", choices=["distance", "logit"], default="distance",
+                    help="coordinate for the right-hand density panel. 'distance' draws "
+                         "||P(h1)-P(h2)|| on a LOG axis with the decision radius -- the same "
+                         "coordinate as the panel to its left, so the two right panels are an "
+                         "ECDF/density pair exactly as columns 1 and 2 are. 'logit' draws "
+                         "a*||.||+b on a linear axis. The two are monotonically related, so "
+                         "the AUROC is identical; they differ only in readability, and the "
+                         "linear one piles a right-skewed quantity against its floor. Falls "
+                         "back to 'logit' when the npz carries no a/b (no radius to draw).")
     ap.add_argument("--dpi", type=int, default=200)
     ap.add_argument("--csv_out", default=None,
                     help="write the per-row AUROCs and median gain, so numbers quoted from "
@@ -343,6 +489,17 @@ def main():
     n = len(rows)
     fig, axes = plt.subplots(n, 4, figsize=(a.panel_w * 4, a.panel_h * n), squeeze=False)
 
+    # ONE VALUE OR ONE PER ROW. Parsed here, beside `rows`, so a length mismatch is reported
+    # against the number of --row flags rather than failing later with an index error.
+    _cp = [x.strip() for x in str(a.logit_clip_pct).split(",") if x.strip()]
+    if len(_cp) == 1:
+        clip_pcts = [float(_cp[0])] * len(rows)
+    elif len(_cp) == len(rows):
+        clip_pcts = [float(x) for x in _cp]
+    else:
+        raise SystemExit(f"--logit_clip_pct has {len(_cp)} values for {len(rows)} --row flags; "
+                         f"pass one value or one per row, in --row order")
+
     summary, row_meta = [], []
     for i, (backbone, assay, individual, path) in enumerate(rows):
         d, y, tnorm, hnorm, ell = load_row(path)
@@ -362,6 +519,29 @@ def main():
         cols = row_colors(backbone)
         row_meta.append((label, cols, backbone))
 
+        # SHARED X UNITS ACROSS ROWS. The two backbones' embeddings differ in magnitude by
+        # roughly 6x, so raw dissimilarity axes are in different units per row and nothing is
+        # comparable left to right -- the reader has to be told so in the caption. Dividing
+        # each column by that row's NON-AS MEDIAN puts every row on "dissimilarity relative to
+        # a typical non-AS locus", where 1.0 means the same thing everywhere. AUROC, the
+        # standardised gain and the ECDF shapes are all invariant to a positive scale factor,
+        # so this changes the axis and nothing else; the divisors go to --csv_out so absolute
+        # values remain recoverable. Non-AS rather than the pooled median because it is the
+        # class the AS distribution is being compared AGAINST.
+        _rel = (a.x_norm == "nonas_median")
+        _xlab_t = ("Haplotype dissimilarity  ||h1 − h2||  / non-AS median" if _rel
+                   else "Haplotype dissimilarity  ||h1 − h2||")
+        _xlab_h = ("Haplotype dissimilarity  ||P(h1) − P(h2)||  / non-AS median" if _rel
+                   else "Haplotype dissimilarity  ||P(h1) − P(h2)||")
+        t_scale = h_scale = 1.0
+        if a.x_norm == "nonas_median":
+            t_scale = float(np.median(np.asarray(tnorm)[y == 0])) or 1.0
+            h_scale = float(np.median(np.asarray(hnorm)[y == 0])) or 1.0
+            tnorm = np.asarray(tnorm, dtype=float) / t_scale
+            hnorm = np.asarray(hnorm, dtype=float) / h_scale
+            if radius:
+                radius = radius / h_scale
+
         # COLUMN ORDER PAIRS EACH SPACE WITH ITS OWN DISTRIBUTION: backbone ECDF, backbone
         # density, head ECDF, head logit density. The violin that used to sit in column 4
         # compared the two spaces to each other, which put a cross-space quantity between two
@@ -372,18 +552,32 @@ def main():
         # edge, which also makes the backbone grouping visible without reading any title.
         au_t, mt1, mt0 = ecdf(
             axes[i][0], tnorm, y, "Backbone embedding",
-            "Haplotype dissimilarity  ||h1 − h2||", colors=cols, logx=lx, fs=a.fontsize)
-        dist_hist(
-            axes[i][1], tnorm, y, "Haplotype dissimilarity  ||h1 − h2||",
-            "Backbone embedding (density)", colors=cols,
-            logx=(lx is not False and lx != "auto"), fs=a.fontsize)
+            _xlab_t, colors=cols, logx=lx, fs=a.fontsize)
+        _mt1d, _mt0d, trunk_kept = dist_hist(
+            axes[i][1], tnorm, y, _xlab_t,
+            "Backbone embedding (distribution)", colors=cols,
+            logx=(lx is not False and lx != "auto"), fs=a.fontsize,
+            clip_q=clip_pcts[i])
         au_h, mh1, mh0 = ecdf(
             axes[i][2], hnorm, y, "HapAdapter head",
-            "Haplotype dissimilarity  ||P(h1) − P(h2)||", colors=cols, logx=lx,
+            _xlab_h, colors=cols, logx=lx,
             vline=radius,
             vlabel=("decision radius" if radius else "no decision radius: npz has no a/b"),
             fs=a.fontsize)
-        au_e = ell_hist(axes[i][2 + 1], ell, y, label, colors=cols, fs=a.fontsize)
+        au_e, ell_kept, ell_hi = ell_hist(axes[i][2 + 1], ell, y, label, colors=cols,
+                                          fs=a.fontsize, clip_q=clip_pcts[i],
+                                          mode=a.head_density, dist=hnorm, radius=radius,
+                                          xlabel=_xlab_h)
+        if ell_kept < 1.0:
+            n_cut = int(round((1 - ell_kept) * len(y)))
+            n_cut_as = int(((ell > ell_hi) & (y == 1)).sum())
+            # Name the coordinate actually drawn: in distance mode ell_hi is a DISSIMILARITY,
+            # not a logit, and calling it "head-logit" made 7.1 look like a logit value next to
+            # a radius of 2.06 on the same row.
+            _coord = ("head-separation" if a.head_density == "distance" else "head-logit")
+            print(f"  [clip] {label}: {_coord} axis ends at {ell_hi:.3g}; "
+                  f"{n_cut} of {len(y)} loci beyond it ({1 - ell_kept:.1%}), "
+                  f"{n_cut_as} of them AS")
         med_gain = median_gain(hnorm, tnorm, y)
 
         summary.append(dict(backbone=backbone, assay=assay, individual=individual,
@@ -392,6 +586,14 @@ def main():
                             trunk_norm_auroc=round(float(au_t), 4),
                             head_norm_auroc=round(float(au_h), 4),
                             ell_auroc=round(float(au_e), 4),
+                            # The AUROC above is computed on ALL loci; the panel only DRAWS
+                            # the kept fraction. Recording both stops a reader reconciling a
+                            # truncated axis against a statistic that used the whole tail.
+                            trunk_x_divisor=round(float(t_scale), 6),
+                            head_x_divisor=round(float(h_scale), 6),
+                            trunk_drawn_fraction=round(float(trunk_kept), 4),
+                            ell_axis_max=round(float(ell_hi), 4),
+                            ell_drawn_fraction=round(float(ell_kept), 4),
                             decision_radius=(round(radius, 4) if radius else None),
                             # Medians carried here rather than in the panel titles, so the
                             # caption can quote them without anyone reading them off the image.

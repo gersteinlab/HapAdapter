@@ -16,10 +16,13 @@ All modifications to the original script are wrapped in comments in the followin
 
 import os
 import csv
-import copy
+# MODIFIED: removed "import copy" (unused in the original and here)
 import json
 import logging
-from dataclasses import dataclass, field
+# MODIFIED: added inspect and dataclasses.field to handle newer transformer versions since DNABERT-2
+import inspect
+from dataclasses import dataclass, field, fields as dataclasses_fields
+####################################################################################################
 from typing import Any, Optional, Dict, Sequence, Tuple, Union
 
 import torch
@@ -31,7 +34,7 @@ from torch.utils.data import Dataset
 from peft import (
     LoraConfig,
     get_peft_model,
-    get_peft_model_state_dict,
+    # MODIFIED: removed get_peft_model_state_dict (unused in the original and here)
 )
 
 ## NEW IMPORTS ##############################################################
@@ -94,18 +97,25 @@ class TrainingArguments(transformers.TrainingArguments):
     save_total_limit: int = field(default=3)
     load_best_model_at_end: bool = field(default=True)
     output_dir: str = field(default="output")
-    find_unused_parameters: bool = field(default=False)
-    checkpointing: bool = field(default=False)
+    # MODIFIED: removed find_unused_parameters and checkpointing (unused in the original and here)
     dataloader_pin_memory: bool = field(default=False)
     eval_and_save_results: bool = field(default=True)
     save_model: bool = field(default=False)
     seed: int = field(default=42)
-    # NEW: regression selects the best checkpoint by Spearman, greater is better!
+    # NEW: regression selects the best checkpoint by Spearman, greater is better! #############################
     metric_for_best_model: str = field(default="spearman")
     greater_is_better: bool = field(default=True)
-    #############################################################################
+    ###########################################################################################################
     # NEW: class-balanced batch sampling (via WeightedRandomSampler) for the rare-positive classification tasks
     balanced_sampler: bool = field(default=False, metadata={"help": "class-balanced batches (classification)"})
+    ###########################################################################################################
+
+    # NEW: handle the evaluation_strategy -> eval_strategy rename in newer transformers versions ##############
+    def __post_init__(self):
+        _parent = {f.name for f in dataclasses_fields(transformers.TrainingArguments)}
+        if "eval_strategy" in _parent and self.evaluation_strategy is not None:
+            self.eval_strategy = self.evaluation_strategy
+        super().__post_init__()
     ###########################################################################################################
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -351,6 +361,11 @@ def make_compute_metrics(task):
 class BalancedTrainer(transformers.Trainer):
     def _make_balanced_sampler(self):
         labels = np.asarray(self.train_dataset.labels, dtype=float)
+        if labels.ndim != 1:
+            raise ValueError(
+                f"--balanced_sampler needs scalar labels, got shape {labels.shape}. Class "
+                f"balancing is for the rare-positive classification task; multi-track Stage-1 "
+                f"regression has no class to balance.")
         yb = (labels > 0.5).astype(int)
         n_pos, n_neg = int(yb.sum()), int((1 - yb).sum())
         if n_pos == 0 or n_neg == 0:
@@ -396,10 +411,13 @@ def train():
                         "change config and re-run to use a different classification metric).")
     ###############################################################################################
 
-    # NEW: validate input_mode ###########################################################################
-    if data_args.input_mode not in ("hap_pair", "ref_single"):
-        raise ValueError(f"--input_mode must be 'hap_pair' or 'ref_single', got {data_args.input_mode!r}.")
-    #######################################################################################################
+    # NEW: validate input_mode ####################################################################
+    if data_args.input_mode != "ref_single":
+        raise ValueError(
+            f"--input_mode {data_args.input_mode!r}: this script fine-tunes the ENCODER, and "
+            f"every readout it has scores ONE window. Use --input_mode ref_single here. "
+            f"To fit a contrast head, use hapadapter.adapter.train.")
+    ###############################################################################################
 
     # MODIFIED: load tokenizer (works for any encoder with detailed settings put in backbones/)
     tokenizer = load_tokenizer({
@@ -408,14 +426,6 @@ def train():
         "model_max_length": training_args.model_max_length,
     })
 
-    # NEW: raise error on paired sequence input (likely would be user intending to train the hapadapter head) ###
-    if data_args.input_mode != "ref_single":
-        raise ValueError(
-            f"--input_mode {data_args.input_mode!r}: this script fine-tunes the ENCODER, and "
-            f"every readout it has scores ONE window. Use --input_mode ref_single here. "
-            f"To fit a contrast head, use hapadapter.adapter.train.")
-    ##############################################################################################################
-
     # define datasets and data collator
     train_dataset = SupervisedDataset(tokenizer=tokenizer,
                                     data_path=os.path.join(data_args.data_path, "train.csv"))
@@ -423,6 +433,8 @@ def train():
                                     data_path=os.path.join(data_args.data_path, "dev.csv"))
     test_dataset = SupervisedDataset(tokenizer=tokenizer,
                                     data_path=os.path.join(data_args.data_path, "test.csv"))
+
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
 
     # NEW: reconcile head width with the dataset before building the model #################
     _ds_labels = train_dataset.num_labels
@@ -502,15 +514,20 @@ def train():
         }, f, indent=2)
     ##############################################################################################
 
+    # MODIFIED: proper keyword for tokenizer chosen from installed transformers version
+    _tok_kw = ("processing_class"
+               if "processing_class" in inspect.signature(transformers.Trainer.__init__).parameters
+               else "tokenizer")
+
     # define trainer [MODIFIED: BalancedTrainer adds optional class-balanced sampling]
     trainer = BalancedTrainer(model=model,
-                                   tokenizer=tokenizer,
-                                   args=training_args,
-                                   preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-                                   compute_metrics=make_compute_metrics(data_args.task),
-                                   train_dataset=train_dataset,
-                                   eval_dataset=val_dataset,
-                                   data_collator=data_collator)
+                              args=training_args,
+                              preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+                              compute_metrics=make_compute_metrics(data_args.task),
+                              train_dataset=train_dataset,
+                              eval_dataset=val_dataset,
+                              data_collator=data_collator,
+                              **{_tok_kw: tokenizer})
                                    
     trainer.train()
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-hapadapter.analysis.dump_contrast_embeddings -- dump per-locus contrast representations
+hapadapter.interpret.dump_contrast_embeddings -- dump per-locus contrast representations
 
   * (Stage 1) TRUNK contrast: h1 - h2      (pool_ref - pool_alt, dimension = d_model)
         -- what the frozen trunk already produces, BEFORE the stage 2 learned projection
@@ -128,6 +128,14 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--label_col", default="label",
                     help="label column; numeric (e.g. 0.5 for '> 0.5 => positive') OR categorical AS/nonAS (as_label)")
+    ap.add_argument("--restrict_loci", default=None,
+                    help="sequence backend: a pair cache (.npz) or per-locus CSV; keep ONLY "
+                         "these (chr, pos) loci.")
+    ap.add_argument("--coord_csv", default=None,
+                    help="sequence backend: row-aligned meta CSV supplying chr/anchor (and "
+                         "total_reads) when --data_csv lacks them. "
+                         "Required by --restrict_loci unless the "
+                         "build CSV already carries coordinates.")
     args = ap.parse_args()
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -165,6 +173,42 @@ def main():
                              f"AS/nonAS/1/0/true/false or a number")
 
     labels = np.array([_lab(r[args.label_col]) for r in rows], dtype=int)
+
+    coord = None
+    if args.coord_csv:
+        with open(args.coord_csv, newline="") as fh:
+            coord = list(csv.DictReader(fh))
+        if len(coord) != len(rows):
+            sys.exit(f"--coord_csv has {len(coord)} rows, --data_csv has {len(rows)}. These "
+                     f"are written as a matched pair; a mismatch means one was regenerated "
+                     f"or subsampled separately.")
+
+    def _col(name, default, cast):
+        src = coord if (coord is not None and name in coord[0]) else (rows if name in cols else None)
+        if src is None:
+            return np.array([default] * len(rows))
+        return np.array([cast(r.get(name) or default) for r in src])
+
+    if args.restrict_loci:
+        from hapadapter.scoring.score_matched import _loci_from
+        want = _loci_from(args.restrict_loci, "restrict_loci")
+        _c = _col("chr", "?", str)
+        _p = _col("anchor", 0, lambda v: int(float(v))).astype(np.int64)
+        if set(_c) == {"?"}:
+            sys.exit("--restrict_loci needs coordinates, but neither --data_csv nor "
+                     "--coord_csv carries a 'chr' column. Pass --coord_csv <build>.meta.csv.")
+        sel = np.array([(str(c), int(p)) in want for c, p in zip(_c, _p)])
+        if not sel.any():
+            sys.exit(f"ZERO of {len(rows)} rows are in --restrict_loci ({len(want)} loci). "
+                     f"Data has e.g. {list(zip(_c, _p))[:2]}, restriction has e.g. "
+                     f"{sorted(want)[:2]}.")
+        rows = [r for r, k in zip(rows, sel) if k]
+        if coord is not None:
+            coord = [r for r, k in zip(coord, sel) if k]
+        labels = labels[sel]
+        print(f"[restrict] {int(sel.sum())} of {len(sel)} rows kept ({len(want)} requested) "
+              f"| {int((labels == 1).sum())} pos {int((labels == 0).sum())} neg")
+
     idx = np.arange(len(rows)) # row indices the subsample selects from
     
     # optional subsample to bound GPU cost
@@ -195,14 +239,9 @@ def main():
     print(f"[in] {len(texts)} loci | pos={int((labels==1).sum())} neg={int((labels==0).sum())}")
 
     # carry coverage and coordinates through to the npz if present
-    def _meta(name, default, cast):
-        if name in cols:
-            return np.array([cast(r.get(name) or default) for r in rows])
-        return np.array([default] * len(rows))
-
-    total_reads = _meta("total_reads", 0.0, float).astype(np.float32)
-    chrom = _meta("chr", "?", str)
-    anchor = _meta("anchor", 0, lambda v: int(float(v))).astype(np.int64)
+    total_reads = _col("total_reads", 0.0, float).astype(np.float32)
+    chrom = _col("chr", "?", str)
+    anchor = _col("anchor", 0, lambda v: int(float(v))).astype(np.int64)
 
     logits, emb, pool_ref, pool_alt, rc = run_inference(
         args.checkpoint_dir, texts, batch_size=args.batch_size,

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-hapadapter.analysis.score_crossdonor -- cross-donor test set ASB-head scoring
+hapadapter.scoring.score_crossdonor -- cross-donor test set ASB-head scoring
 (both ref and personal test sets supported)
 
 Writes one per-head CSV: assay, train_donor, eval_donor, arm, donor_kind, auroc, n, n_pos
@@ -146,6 +146,49 @@ def verify_folds(exp_root, assay, arm, train_donor, donors, bin_size):
 
     return not leaked
 
+def score_cached(head_dir, cache, pair_csv, meta_csv, cov_col, label_col="label"):
+    """Score one donor's test split from an embedding cache"""
+    import json
+    import torch
+    from hapadapter.adapter.head import HapAdapterHead
+    from hapadapter.fit_adapter import load_cached_split
+    from hapadapter.trunk.loading import find_weights_file, _load_state_dict
+    from hapadapter.scoring.stats import balanced_auroc
+
+    cfg = json.load(open(os.path.join(head_dir, "run_config.json")))
+    if cfg.get("head_variant") != "twin":
+        raise SystemExit(f"{head_dir} is a {cfg.get('head_variant')!r} head; the cached "
+                         f"cross-donor path scores twin heads only.")
+
+    xf = cfg.get("cache_transform", "auto")
+    split = load_cached_split(cache, pair_csv, meta_csv, label_col, "depth", cov_col,
+                              xf, "crossdonor", 0.0)
+
+    import inspect
+    accepted = set(inspect.signature(HapAdapterHead.__init__).parameters) - {"self"}
+    head = HapAdapterHead(**{k: v for k, v in cfg.items() if k in accepted})
+    head.load_state_dict(_load_state_dict(find_weights_file(head_dir)), strict=True)
+    head.eval()
+
+    if cfg.get("d_in") and split["D"] != cfg["d_in"]:
+        raise SystemExit(f"cache width {split['D']} != head d_in {cfg['d_in']} -- this cache "
+                         f"came from a different backbone or pooling mode.")
+
+    with torch.no_grad():
+        ell = head(torch.as_tensor(split["h1"], dtype=torch.float32),
+                   torch.as_tensor(split["h2"], dtype=torch.float32)).numpy().reshape(-1)
+    y = split["y"].astype(int)
+    if y.min() == y.max():
+        return float("nan"), float("nan"), len(y), int(y.sum()), 0
+
+    plain = float(roc_auc_score(y, ell))
+    cov = split["cov"]
+    if cov is None:
+        print(f"[cov] WARNING: {meta_csv} has no {cov_col!r} column -- the matched AUROC falls "
+              f"back to class-balancing only and is not depth-controlled")
+    matched, _ap, _ci, n_match = balanced_auroc(ell, y, cover=cov)
+    return float(matched), plain, len(y), int(y.sum()), int(n_match)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint_dir", required=True, help="the trained head (train_donor's arm)")
@@ -155,6 +198,17 @@ def main():
     ap.add_argument("--exp_root", required=True)
     ap.add_argument("--donors", nargs="+", required=True)
     ap.add_argument("--out", required=True, help="per-head output CSV (overwritten, not appended)")
+    ap.add_argument("--backend", choices=["sequence", "cached"], default="sequence",
+                    help="sequence: forward the haplotype pairs through trunk+head or "
+                         "cached: read pooled vectors from an embedding cache and apply only "
+                         "the head.")
+    ap.add_argument("--ag_root", default=None,
+                    help="cached backend: root holding emb/. Used by --cache_tpl.")
+    ap.add_argument("--cache_tpl", default="{ag_root}/emb/ag_{assay}_{donor}_test_1bp.npz",
+                    help="cached backend: per-donor cache path template, {assay} and {donor} substituted.")
+    ap.add_argument("--cov_col", default="total_reads",
+                    help="cached backend: coverage column in the META table, for the matched "
+                         "AUROC. Default matches fit_adapter")
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--verify_folds", action="store_true",
@@ -170,6 +224,9 @@ def main():
                 "the cross-donor AUROCs would be leaky! Rebuild the Stage-2 folds, or drop the "
                 "offending donor from --donors.")
 
+    if a.backend == "cached" and not a.ag_root and "{ag_root}" in a.cache_tpl:
+        raise SystemExit("--backend cached needs --ag_root (or a --cache_tpl without "
+                         "{ag_root} in it)")
     rows = []
 
     for ed in a.donors:
@@ -178,8 +235,21 @@ def main():
             print(f"[skip] {a.assay}/{ed} {a.arm}: no test.csv at {tcsv}")
             continue
 
-        au, au_plain, n, npos, n_match = score_on(a.checkpoint_dir, tcsv, a.batch_size, a.device)
-        
+        if a.backend == "cached":
+            cache = a.cache_tpl.format(ag_root=a.ag_root or "", assay=a.assay.lower(), donor=ed)
+            if not os.path.exists(cache):
+                print(f"[skip] {a.assay}/{ed}: no cache at {cache}")
+                continue
+            mcsv = tcsv.replace("test.csv", "test.meta.csv")
+            if not os.path.exists(mcsv):
+                print(f"[skip] {a.assay}/{ed}: no meta beside {tcsv}")
+                continue
+            au, au_plain, n, npos, n_match = score_cached(
+                a.checkpoint_dir, cache, tcsv, mcsv, a.cov_col)
+        else:
+            au, au_plain, n, npos, n_match = score_on(
+                a.checkpoint_dir, tcsv, a.batch_size, a.device)
+
         kind = "matched" if ed == a.train_donor else "cross-donor"
         rows.append(dict(assay=a.assay, train_donor=a.train_donor, eval_donor=ed, arm=a.arm,
                          head_variant=_head_variant(a.checkpoint_dir), donor_kind=kind,
