@@ -3,8 +3,9 @@
 hapadapter.adapter.train -- fit the HapAdapter head, on cached embeddings or a live encoder
 ** the head is identical either way, only where h1/h2 come from differs: **
 
-    fit_cached        h1, h2 are precomputed pooled embeddings. Required when the backbone
-                      cannot be expressed in a torch graph at all (AlphaGenome)
+    fit_cached        h1, h2 are precomputed pooled embeddings
+                      ** required when the backbone cannot be expressed 
+                         in a torch graph at all (e.g. AlphaGenome) **
     fit_end_to_end    h1, h2 are pooled from an encoder inside the training step
 
 Both run through the SAME transformers.Trainer with the same objective,
@@ -86,7 +87,7 @@ def backbone_fingerprint(encoder) -> str:
     for k in sorted(k for k in sd if k.split(".")[0] == "backbone"):
         t = sd[k].detach().cpu().contiguous()
         h.update(k.encode())
-        h.update(t.numpy().tobytes())
+        h.update(t.view(torch.uint8).numpy().tobytes())
     return h.hexdigest()
 
 def save_head(head: HapAdapterHead, out_dir: str, *, neff_s: float,
@@ -157,6 +158,10 @@ def _binary_metrics(eval_pred):
     if 0 < n_pos < len(y):
         return {"auroc": float(roc_auc_score(y, ell)),
                 "auprc": float(average_precision_score(y, ell)), "n_pos": float(n_pos)}
+    import warnings
+    warnings.warn(
+        f"dev split has {n_pos} positives of {len(y)}: auroc/auprc are nan and "
+        f"best-on-dev selection will default to keeping the first checkpoint.", RuntimeWarning)
     return {"auroc": float("nan"), "auprc": float("nan"), "n_pos": float(n_pos)}
 
 def _trainer(model, train_ds, eval_ds, out_dir, *, lr, weight_decay, epochs, batch_size,
@@ -177,6 +182,17 @@ def _trainer(model, train_ds, eval_ds, out_dir, *, lr, weight_decay, epochs, bat
                 f"'eval_strategy' nor 'evaluation_strategy'; pass the right name via extra_args."
             )
         args[key] = "epoch"
+        if select_on and select_on != "loss":
+            _lab = getattr(eval_ds, "labels", None)
+            if _lab is not None:
+                _y = [1 if float(v) > 0.5 else 0 for v in _lab]
+                _np = sum(_y)
+                if not 0 < _np < len(_y):
+                    raise ValueError(
+                        f"the dev split has {_np} positives out of {len(_y)} loci, so "
+                        f"eval_{select_on} is undefined and best-on-dev selection would "
+                        f"just keep the first checkpoint. Fix the split, or pass "
+                        f"select_on='loss' to select on the objective instead.")
         if select_on:
             args["save_strategy"] = "epoch"
             args["save_total_limit"] = 2
@@ -190,7 +206,7 @@ def _trainer(model, train_ds, eval_ds, out_dir, *, lr, weight_decay, epochs, bat
         train_dataset=train_ds, eval_dataset=eval_ds,
         compute_metrics=_binary_metrics if eval_ds is not None else None)
 
-def fit_cached(head, train, dev=None, *, neff_s=20.0, lr=1e-3, weight_decay=0.01, epochs=25,
+def fit_cached(head, train, dev=None, *, neff_s=20.0, lr=1e-3, weight_decay=0.01, epochs=3,
                batch_size=32, seed=20, out_dir="./head_run", select_on="auroc", extra_args=None):
     """
     Fit `head` on precomputed pooled embeddings,
@@ -203,7 +219,7 @@ def fit_cached(head, train, dev=None, *, neff_s=20.0, lr=1e-3, weight_decay=0.01
     return model, (tr.evaluate() if dev is not None else None)
 
 def fit_end_to_end(encoder, head, train, dev=None, *, neff_s=20.0, lr=1e-3, weight_decay=0.01,
-                   epochs=25, batch_size=8, seed=20, out_dir="./head_run", select_on="auroc",
+                   epochs=3, batch_size=8, seed=20, out_dir="./head_run", select_on="auroc",
                    data_collator=None, trainer_cls=None, extra_args=None):
     """
     Fit `head` with a live encoder (frozen but left in train() mode for dropout variation)

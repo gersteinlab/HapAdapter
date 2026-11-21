@@ -2,13 +2,14 @@
 """
 hapadapter.fit_adapter -- fit a HapAdapterHead, from either backend option
 
-    --backend cached     train on PRECOMPUTED pooled embeddings (npz caches).
-                         Any backbone, including ones that are not torch models at all
+    --backend cached     train on PRECOMPUTED pooled embeddings (npz caches);
+                         any backbone, including ones that are not torch models at all
                          (e.g. AlphaGenome runs in JAX, in a different environment)
-                         Only requires CPUs.
+                         ** only requires CPUs **
 
-    --backend sequence   train with a live but FROZEN torch encoder in the loop, from the build's
-                         sequence CSVs. Requires GPU + transformers.
+    --backend sequence   train with a live but FROZEN torch encoder in the loop,
+                         from the build's sequence CSVs
+                         ** requires GPU + transformers **
 
 Same head with same loss fit either way
 """
@@ -28,7 +29,7 @@ from hapadapter.backbones.cache import load_pair_cache, resolve_coord_columns
 # Option 1: cached embeddings
 # ---------------------------------------------------------------------------------------------
 
-def load_cached_split(cache, pair_csv, meta_csv, label_col, depth_col, cov_col, transform, tag, min_ok_frac=0.0):
+def load_cached_split(cache, pair_csv, meta_csv, label_col, depth_col, cov_col, transform, tag, min_ok_frac=0.5):
     """For one split, embeddings joined to the build's labels, depth, and coordinates"""
     pair = pd.read_csv(pair_csv)
     meta = pd.read_csv(meta_csv)
@@ -257,7 +258,7 @@ def build_head(a, d_in):
                           head_dropout=a.head_dropout,
                           pool_dropout=a.pool_dropout)
 
-    print(f"[head] {a.head_variant} on d_in={d_in} "
+    print(f"[head] twin on d_in={d_in} "
           f"({sum(p.numel() for p in head.parameters()):,} parameters) "
           f"| {a.head_num_layers} layer(s), hidden {a.head_hidden_size}, proj {a.proj_dim}")
     return head
@@ -297,9 +298,10 @@ def main():
         ap.add_argument(f"--{split}_cache")
         ap.add_argument(f"--{split}_pair")
         ap.add_argument(f"--{split}_meta")
-    ap.add_argument("--min_ok_frac", type=float, default=0.0,
-                    help="cached: minimum fraction of the meta table's loci that must be in "
-                         "the cache. Default 0 for a full build; adjust if you are sampling.")
+    ap.add_argument("--min_ok_frac", type=float, default=0.5,
+                    help="cached: minimum fraction of the meta table's loci that must be "
+                         "present in the cache, else refuse. Pass 0 to fit on a partial join "
+                         "on purpose.")
     # ---- backend: sequence
     ap.add_argument("--build_dir",
                     help="sequence: directory holding train/dev/test.csv + .meta.csv")
@@ -320,7 +322,7 @@ def main():
     ap.add_argument("--label_col", default="label")
     ap.add_argument("--depth_col", default="depth", help="the build's precision weight")
     ap.add_argument("--cov_col", default="total_reads", help="coverage column in the META table")
-    ap.add_argument("--head_variant", default="twin", choices=["twin", "single"])
+    ap.add_argument("--head_variant", default="twin", choices=["twin"])
     ap.add_argument("--proj_dim", type=int, default=128)
     ap.add_argument("--head_num_layers", type=int, default=2)
     ap.add_argument("--head_hidden_size", type=int, default=128)
@@ -331,7 +333,7 @@ def main():
     ap.add_argument("--neff_s", type=float, default=20.0)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight_decay", type=float, default=0.01)
-    ap.add_argument("--epochs", type=int, default=25)
+    ap.add_argument("--epochs", type=int, default=3)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--seed", type=int, default=20)
     ap.add_argument("--eval_strategy", default="epoch", choices=["epoch", "steps"])
@@ -347,6 +349,12 @@ def main():
                    if not getattr(a, f"{s}_{k}")]
         if missing:
             raise SystemExit(f"--backend cached needs {', '.join(missing)}")
+        for s in ("dev", "test"):
+            have = {k: getattr(a, f"{s}_{k}") for k in ("cache", "pair", "meta")}
+            if any(have.values()) and not all(have.values()):
+                raise SystemExit(
+                    f"--{s}_cache/--{s}_pair/--{s}_meta must be given together; got "
+                    + ", ".join(f"--{s}_{k}={'set' if v else 'MISSING'}" for k, v in have.items()))
         splits, d_in, xf = _load_cached(a)
         provenance = dict(train_cache=os.path.abspath(a.train_cache), cache_transform=xf)
     else:
@@ -365,7 +373,6 @@ def main():
 
     if a.backend == "cached":
         def ds(s):
-            # the single-window head ignores h2, so passing it is harmless either way
             return PooledPairDataset(s["h1"], s["h2"], s["y"], s["depth"])
 
         model, dev_metrics = fit_cached(
@@ -386,7 +393,7 @@ def main():
                          n_train=len(splits["train"]["y"]), lr=a.lr,
                          weight_decay=a.weight_decay, epochs=a.epochs,
                          batch_size=a.batch_size, seed=a.seed, label_col=a.label_col,
-                        depth_col=a.depth_col, eval_strategy=a.eval_strategy,
+                         depth_col=a.depth_col, eval_strategy=a.eval_strategy,
                          eval_steps=a.eval_steps if a.eval_strategy == "steps" else None,
                          **provenance))
 
