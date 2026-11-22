@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """
-hapadapter.scoring.score_crossdonor -- cross-donor test set ASB-head scoring
-(both ref and personal test sets supported)
+hapadapter.scoring.score_crossdonor -- cross-donor test set for HapAdapter head scoring
+(both ref/alt and hap1/hap2 test sets supported)
 
 Writes one per-head CSV: assay, train_donor, eval_donor, arm, donor_kind, auroc, n, n_pos
 """
@@ -31,18 +31,15 @@ def score_on(head_dir, test_csv, batch_size, device):
     if "label" not in df.columns:
         raise ValueError(f"{test_csv}: no label column; got {list(df.columns)[:6]}")
 
-    if variant == "twin":
-        if "sequence1" not in df.columns or "sequence2" not in df.columns:
-            raise ValueError(f"{test_csv}: head_variant='twin' needs sequence1,sequence2; "
-                             f"got {list(df.columns)[:6]} -- is this a ref_single build?")
-        texts = [[s1, s2] for s1, s2 in zip(df["sequence1"].astype(str), df["sequence2"].astype(str))]
-    elif variant == "single":
-        if "sequence" not in df.columns:
-            raise ValueError(f"{test_csv}: head_variant='single' needs a flat `sequence` column; "
-                             f"got {list(df.columns)[:6]} -- is this a hap_pair build?")
-        texts = df["sequence"].astype(str).tolist()
-    else:
-        raise ValueError(f"{head_dir}: unknown head_variant {variant!r} (expected twin|single)")
+    if variant != "twin":
+        raise ValueError(f"{head_dir}: head_variant={variant!r}, but only 'twin' heads can be "
+                         f"scored here. Re-fit this head to score.")
+
+    if "sequence1" not in df.columns or "sequence2" not in df.columns:
+        raise ValueError(f"{test_csv}: a twin head needs sequence1,sequence2; "
+                         f"got {list(df.columns)[:6]}.")
+
+    texts = [[s1, s2] for s1, s2 in zip(df["sequence1"].astype(str), df["sequence2"].astype(str))]
 
     logits, _emb, _rc = run_inference(head_dir, texts, batch_size, device)
     ell = np.asarray(logits).reshape(-1)
@@ -54,7 +51,7 @@ def score_on(head_dir, test_csv, batch_size, device):
     cov_col = next((c for c in ("depth", "total_reads") if c in df.columns), None)
     if cov_col is None:
         print(f"[cov] WARNING: {test_csv} has no depth/total_reads column -- the matched AUROC "
-              f"falls back to class-balancing only and is NOT depth-controlled")
+              f"falls back to class-balancing only and is not depth-controlled")
         cov = None
     else:
         cov = df[cov_col].to_numpy(float)
@@ -65,18 +62,29 @@ def score_on(head_dir, test_csv, batch_size, device):
     matched, _aupr, _ci, n_matched = balanced_auroc(ell, y, cover=cov)
     return float(matched), plain, len(y), int(y.sum()), int(n_matched)
 
+DATA_TPL = "{exp_root}/{assay_lower}_{donor}/stage2_{arm}_data"
+
+def split_dir(exp_root, assay, donor, arm, data_tpl=None):
+    """Directory holding one donor-arm's HapAdapter training CSVs, from --data_tpl"""
+    try:
+        return (data_tpl or DATA_TPL).format(
+            exp_root=exp_root, assay=assay, assay_lower=assay.lower(), donor=donor, arm=arm)
+    except KeyError as e:
+        raise SystemExit(f"--data_tpl {data_tpl!r}: unknown placeholder {e}. "
+                         f"Available: {{exp_root}} {{assay}} {{assay_lower}} "
+                         f"{{donor}} {{arm}}")
+
 def _meta_coords(path):
     """(chr, pos) set from a *.meta.csv"""
     tc = pd.read_csv(path)
-    chrom_col = "chr" if "chr" in tc.columns else tc.columns[0]
-    pos_col = ("SNV" if "SNV" in tc.columns else "pos" if "pos" in tc.columns
-               else "anchor" if "anchor" in tc.columns else
-               "ref_start" if "ref_start" in tc.columns else None)
-    if pos_col is None:
-        raise ValueError(f"{path}: no SNV/pos/anchor/ref_start column ({list(tc.columns)[:6]}...)")
-    return set(zip(tc[chrom_col].astype(str), tc[pos_col].astype(int)))
+    chrom_col = next((c for c in ("chr", "chrom") if c in tc.columns), None)
+    pos_col = next((c for c in ("SNV", "pos", "anchor", "ref_start") if c in tc.columns), None)
+    if chrom_col is None or pos_col is None:
+        raise ValueError(f"{path}: need a chromosome column from ('chr', 'chrom') and a "
+                         f"position column from ('SNV', 'pos', 'anchor', 'ref_start'); "
+                         f"got {list(tc.columns)[:8]}")
 
-def verify_folds(exp_root, assay, arm, train_donor, donors, bin_size):
+def verify_folds(exp_root, assay, arm, train_donor, donors, bin_size, data_tpl=None):
     """
     Check the crucial two cross-donor comparison conditions:
 
@@ -87,7 +95,7 @@ def verify_folds(exp_root, assay, arm, train_donor, donors, bin_size):
     Comparability differences warn but do not fail
     """
     def meta(d, split):
-        return os.path.join(exp_root, f"{assay.lower()}_{d}", f"stage2_{arm}_data", f"{split}.meta.csv")
+        return os.path.join(split_dir(exp_root, assay, d, arm, data_tpl), f"{split}.meta.csv")
 
     seen = set()
     for split in ("train", "dev"):
@@ -98,9 +106,9 @@ def verify_folds(exp_root, assay, arm, train_donor, donors, bin_size):
         seen |= _meta_coords(p)
 
     if not seen:
-        print("[verify_folds] WARNING: no train/dev coords for "
-              f"{train_donor}; cannot verify leakage for this donor.")
-        return True
+        print(f"[verify_folds] FAIL: no train/dev coords found for {train_donor} under "
+              f"{exp_root}; leakage cannot be verified.")
+        return False
 
     seen_bins = {(c, p // bin_size) for c, p in seen}
     print(f"[verify_folds] {train_donor} train+dev: {len(seen)} loci, {len(seen_bins)} bins")
@@ -122,7 +130,7 @@ def verify_folds(exp_root, assay, arm, train_donor, donors, bin_size):
             leaked = True
 
     if len(test_sets) > 1:
-        # check that no test binds for one donor end up in train or dev for another
+        # check that no test bins for one donor end up in train or dev for another
         seen_by = {}
         for d in test_sets:
             s = set()
@@ -144,7 +152,7 @@ def verify_folds(exp_root, assay, arm, train_donor, donors, bin_size):
 
     return not leaked
 
-def score_cached(head_dir, cache, pair_csv, meta_csv, cov_col, label_col="label"):
+def score_cached(head_dir, cache, pair_csv, meta_csv, cov_col, label_col="label", cache_transform=None, min_ok_frac=0.5):
     """Score one donor's test split from an embedding cache"""
     import json
     import torch
@@ -158,9 +166,14 @@ def score_cached(head_dir, cache, pair_csv, meta_csv, cov_col, label_col="label"
         raise SystemExit(f"{head_dir} is a {cfg.get('head_variant')!r} head; the cached "
                          f"cross-donor path scores twin heads only.")
 
-    xf = cfg.get("cache_transform", "auto")
+    xf = cache_transform or cfg.get("cache_transform")
+    if xf is None:
+        raise SystemExit(
+            f"{head_dir}/run_config.json records no 'cache_transform', so the embedding "
+            f"preprocessing used at fit time cannot be reproduced. Pass --cache_transform "
+            f"explicitly if you know what the fit used.")
     split = load_cached_split(cache, pair_csv, meta_csv, label_col, "depth", cov_col,
-                              xf, "crossdonor", 0.0)
+                              xf, "crossdonor", min_ok_frac)
 
     import inspect
     accepted = set(inspect.signature(HapAdapterHead.__init__).parameters) - {"self"}
@@ -193,6 +206,10 @@ def main():
     ap.add_argument("--assay", required=True)
     ap.add_argument("--train_donor", required=True)
     ap.add_argument("--arm", choices=["ref", "personal", "ref_single", "personal_single"], default="ref")
+    ap.add_argument("--data_tpl", default=DATA_TPL,
+                    help=f"directory holding one donor-arm's HapAdapter training split CSVs. Placeholders: "
+                         f"{{exp_root}} {{assay}} {{assay_lower}} {{donor}} {{arm}}. "
+                         f"Default: {DATA_TPL}")
     ap.add_argument("--exp_root", required=True)
     ap.add_argument("--donors", nargs="+", required=True)
     ap.add_argument("--out", required=True, help="per-head output CSV (overwritten, not appended)")
@@ -204,6 +221,10 @@ def main():
                     help="cached backend: root holding emb/. Used by --cache_tpl.")
     ap.add_argument("--cache_tpl", default="{ag_root}/emb/ag_{assay}_{donor}_test_1bp.npz",
                     help="cached backend: per-donor cache path template, {assay} and {donor} substituted.")
+    ap.add_argument("--cache_transform", default=None, choices=[None, "auto", "none", "log1p"],
+                    help="cached backend: override the transform recorded in the head's "
+                         "run_config.json. Only needed for a head fitted before that field "
+                         "existed.")
     ap.add_argument("--cov_col", default="total_reads",
                     help="cached backend: coverage column in the META table, for the matched "
                          "AUROC. Default matches fit_adapter")
@@ -211,15 +232,18 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--verify_folds", action="store_true",
                     help="before scoring, check that for cross-donor leakage and comparability")
+    ap.add_argument("--min_ok_frac", type=float, default=0.5,
+                    help="cached backend: refuse if fewer than this fraction of the donor's "
+                         "test loci are present in the cache. 0 disables the check.")
     ap.add_argument("--bin_size", type=int, default=100000,
                     help="leak-bin size for --verify_folds; must match the scorers' bin_size")
     a = ap.parse_args()
 
     if a.verify_folds:
-        if not verify_folds(a.exp_root, a.assay, a.arm, a.train_donor, a.donors, a.bin_size):
+        if not verify_folds(a.exp_root, a.assay, a.arm, a.train_donor, a.donors, a.bin_size, data_tpl=a.data_tpl):
             raise SystemExit(
                 "FATAL: the head's train/dev coordinates overlap an eval donor's test set -- "
-                "the cross-donor AUROCs would be leaky! Rebuild the Stage-2 folds, or drop the "
+                "the cross-donor AUROCs would be leaky! Rebuild the train/dev/test folds, or drop the "
                 "offending donor from --donors.")
 
     if a.backend == "cached" and not a.ag_root and "{ag_root}" in a.cache_tpl:
@@ -228,7 +252,8 @@ def main():
     rows = []
 
     for ed in a.donors:
-        tcsv = os.path.join(a.exp_root, f"{a.assay.lower()}_{ed}", f"stage2_{a.arm}_data", "test.csv")
+        sd = split_dir(a.exp_root, a.assay, ed, a.arm, a.data_tpl)
+        tcsv = os.path.join(sd, "test.csv")
         if not os.path.exists(tcsv):
             print(f"[skip] {a.assay}/{ed} {a.arm}: no test.csv at {tcsv}")
             continue
@@ -238,12 +263,13 @@ def main():
             if not os.path.exists(cache):
                 print(f"[skip] {a.assay}/{ed}: no cache at {cache}")
                 continue
-            mcsv = tcsv.replace("test.csv", "test.meta.csv")
+            mcsv = os.path.join(sd, "test.meta.csv")
             if not os.path.exists(mcsv):
                 print(f"[skip] {a.assay}/{ed}: no meta beside {tcsv}")
                 continue
             au, au_plain, n, npos, n_match = score_cached(
-                a.checkpoint_dir, cache, tcsv, mcsv, a.cov_col)
+                a.checkpoint_dir, cache, tcsv, mcsv, a.cov_col,
+                cache_transform=a.cache_transform, min_ok_frac=a.min_ok_frac)
         else:
             au, au_plain, n, npos, n_match = score_on(
                 a.checkpoint_dir, tcsv, a.batch_size, a.device)
