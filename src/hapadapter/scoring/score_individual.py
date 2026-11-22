@@ -3,8 +3,6 @@
 hapadapter.analysis.score_individual -- within-individual ASB-head scoring (both arms --ref and --personal supported)
 
 NOTE: does NOT compute AUROC (within-individual AUROC read from the Trainer output eval_results.json)
-
-File written by Amy Metrick in collaboration with Anthropic's Claude Science Opus 5 Agent
 """
 import argparse
 import numpy as np
