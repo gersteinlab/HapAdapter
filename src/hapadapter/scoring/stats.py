@@ -5,6 +5,7 @@ hapadapter.stats -- shared helpers for post-hoc scoring and interpretability
 """
 
 import os
+import re
 import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score, average_precision_score
@@ -28,10 +29,12 @@ def load_hetsnv(path, assay, min_total_reads):
     usecols = ["chr", "ref_start", "ref_end", "ref_allele", "hap1_allele", "hap2_allele",
                "donor", "tissue", "assay", "cA", "cC", "cG", "cT",
                "ref_allele_ratio", "p_betabinom", "imbalance_significance"]
-    # NOTE: ref_allele_ratio and p_betabinom are not currently used, but are carried through in case they are desired for any later analysis
+    # NOTE: ref_allele_ratio and p_betabinom are not currently used, but are carried through
+    # in case they are wanted for any later analysis
 
     REQUIRED = ["chr", "ref_start", "ref_allele", "hap1_allele", "hap2_allele",
                 "assay", "cA", "cC", "cG", "cT", "imbalance_significance"]
+
     df = pd.read_csv(path, sep="\t", usecols=lambda c: c in usecols)
     missing = [c for c in REQUIRED if c not in df.columns]
     if missing:
@@ -39,7 +42,13 @@ def load_hetsnv(path, assay, min_total_reads):
                        f"found {list(df.columns)}")
 
     if assay and assay.upper() != "ALL":
-        df = df[df["assay"].astype(str).str.contains(assay, case=False, na=False)]
+        pat = re.escape(assay) + r"(?![A-Za-z0-9])"
+        df = df[df["assay"].astype(str).str.contains(pat, case=False, na=False, regex=True)]
+        hit = sorted(set(df["assay"].astype(str)))
+        if len(hit) > 1:
+            print(f"[load] NOTE: assay={assay!r} matched {len(hit)} distinct values {hit}; "
+                  f"these are being pooled.")
+
     df = df.reset_index(drop=True)
 
     n_nonsnv = int((~df["hap1_allele"].astype(str).str.upper().isin(list("ACGT")) |
@@ -51,6 +60,7 @@ def load_hetsnv(path, assay, min_total_reads):
     df["hap2_count"] = _counts_for(df, "hap2_allele")
     df["total_reads"] = df["hap1_count"] + df["hap2_count"]
     df["signed_log_count_ratio"] = np.log2((df["hap1_count"] + 0.5) / (df["hap2_count"] + 0.5))
+
     if min_total_reads:
         n0 = len(df)
         df = df[df["total_reads"] >= min_total_reads].reset_index(drop=True)
@@ -73,16 +83,23 @@ def seen_bins_from_meta(coord_files, bin_size):
     for path in coord_files or []:
         if not os.path.exists(path):
             print(f"[leakage] WARNING: {path} not found; skipping."); continue
+        
         tc = pd.read_csv(path)
-        chrom_col = "chr" if "chr" in tc.columns else tc.columns[0]
+        chrom_col = next((c for c in ("chr", "chrom") if c in tc.columns), None)
+        if chrom_col is None:
+            print(f"[leakage] {path}: no chr/chrom column ({list(tc.columns)[:6]}...); skipping.")
+            continue
+
         pos_col = ("SNV" if "SNV" in tc.columns else "pos" if "pos" in tc.columns
                    else "anchor" if "anchor" in tc.columns else None)
         if pos_col is None:
             print(f"[leakage] {path}: no SNV/pos/anchor column ({list(tc.columns)[:6]}...); skipping.")
             continue
+        
         before = len(seen)
         seen |= set(zip(tc[chrom_col].astype(str), (tc[pos_col].astype(int) // bin_size)))
         print(f"[leakage] {os.path.basename(path)}: +{len(seen)-before} bins, {len(seen)} seen total")
+    
     return seen
 
 def flag_leaky(df, seen, bin_size, chrom_col, pos_col, pos_is_1based):
@@ -106,9 +123,13 @@ def build_windows(df, ref_fasta, left_bp, right_bp, chrom_col, pos_col, refbase_
         df[chrom_col], df[pos_col], df[refbase_col], df[a1_col], df[a2_col]
     ):
         if chrom not in fa:
-            keep.append(False); seqs1.append(""); seqs2.append(""); n_badchrom += 1; continue
+            keep.append(False)
+            seqs1.append("")
+            seqs2.append("")
+            n_badchrom += 1
+            continue
 
-        # Reject non-single-base alleles (N/ambiguity codes, indels, NaN, empty) that would mess up window length
+        # reject non-single-base alleles (N/ambiguity codes, indels, NaN, empty) that would mess up window length
         a1s, a2s = str(a1).upper(), str(a2).upper()
         if a1s not in ("A","C","G","T") or a2s not in ("A","C","G","T"):
             keep.append(False); seqs1.append(""); seqs2.append(""); n_badallele += 1; continue
@@ -119,17 +140,29 @@ def build_windows(df, ref_fasta, left_bp, right_bp, chrom_col, pos_col, refbase_
         clen = len(fa[chrom])
 
         if start < 0 or end > clen:
-            keep.append(False); seqs1.append(""); seqs2.append(""); n_oob += 1; continue
+            keep.append(False)
+            seqs1.append("")
+            seqs2.append("")
+            n_oob += 1
+            continue
+
         seq = str(fa[chrom][start:end])
 
         if len(seq) != win:
-            keep.append(False); seqs1.append(""); seqs2.append(""); n_oob += 1; continue
+            keep.append(False)
+            seqs1.append("")
+            seqs2.append("")
+            n_oob += 1
+            continue
 
         center = left_bp
         if seq[center] != str(ref_a).upper():
             n_refmismatch += 1
             if drop_refmismatch:
-                keep.append(False); seqs1.append(""); seqs2.append(""); continue
+                keep.append(False)
+                seqs1.append("")
+                seqs2.append("")
+                continue
 
         seqs1.append(seq[:center] + a1s + seq[center + 1:])
         seqs2.append(seq[:center] + a2s + seq[center + 1:])
@@ -146,11 +179,12 @@ def build_windows(df, ref_fasta, left_bp, right_bp, chrom_col, pos_col, refbase_
 
     return seqs1, seqs2, np.array(keep, dtype=bool)
 
-def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20):
-    # cover=None -> random balance (original behavior)
+def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20, verbose=None):
+    # cover=None -> random balance
     # cover given -> COVERAGE-MATCHED balance:
-    # subsample the larger class so its coverage (depth) distribution matches the smaller class
+        # subsample the larger class so its coverage (depth) distribution matches the smaller class
 
+    verbose = bool(n_boot) if verbose is None else bool(verbose)
     score = np.asarray(score, dtype=float)
     label = np.asarray(label, dtype=int)
 
@@ -159,7 +193,7 @@ def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20):
     m = min(len(pos_idx), len(neg_idx))
 
     if m < 10:
-        if n_boot:
+        if verbose:
             print(f"[auroc] only {m} in the smaller class (<10) -- returning NaN. "
                   f"{len(pos_idx)} positive / {len(neg_idx)} negative.")
         return np.nan, np.nan, (np.nan, np.nan), m
@@ -188,7 +222,7 @@ def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20):
             small_b = small[sb == b]
             want = len(small_b)
             if not len(pool):
-                # No large-class member shares this coverage bin, 
+                # no large-class member shares this coverage bin, 
                 # so these small-class members have no match -> drop them
                 n_unmatched += want
                 continue
@@ -200,9 +234,9 @@ def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20):
         sel_small = np.concatenate(keep_small) if keep_small else small[:0]
         sel_large = np.concatenate(picks) if picks else large[:0]
 
-        # Drop large-class rows outside the small class's coverage range
+        # drop large-class rows outside the small class's coverage range
         n_oor = int((lb == 0).sum() + (lb == len(edges)).sum())
-        if n_boot and (n_oor or n_unmatched or n_dup):
+        if verbose and (n_oor or n_unmatched or n_dup):
             print(f"[auroc] coverage match: {len(sel_small)} per class | "
                   f"{n_oor} large-class rows outside the matched range "
                   f"({n_oor/max(len(large),1):.1%}), {n_unmatched} small-class rows with no "
@@ -218,7 +252,7 @@ def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20):
         f"coverage match left {len(sel_pos)} vs {len(sel_neg)} -- not a balanced comparison"
 
     if m < 10:
-        if n_boot:
+        if verbose:
             print(f"[auroc] coverage matching left only {m} per class (<10) -- returning NaN. "
                   f"The two classes' coverage distributions barely overlap, so there is no "
                   f"depth-matched comparison to make here.")
@@ -274,8 +308,10 @@ def pool_hetsnv_tissues(df):
     return g
 
 def dump_pools_npz(out, df, pool_ref, pool_alt, id_col):
-    """Write {out}_pools.npz with the twin pooled embeddings,
-    Requires df to carry: `id_col`, `label` (from load_hetsnv), and `leaky` (from flag_leaky)"""
+    """
+    Write {out}_pools.npz with the twin pooled embeddings,
+    ** requires df to carry `id_col`, `label` (from load_hetsnv), and `leaky` (from flag_leaky) **
+    """
     missing = [c for c in (id_col, "label", "leaky") if c not in df.columns]
     if missing:
         raise KeyError(f"dump_pools_npz needs column(s) {missing} on df "

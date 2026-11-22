@@ -4,8 +4,6 @@ hapadapter.scoring.score_crossdonor -- cross-donor test set ASB-head scoring
 (both ref and personal test sets supported)
 
 Writes one per-head CSV: assay, train_donor, eval_donor, arm, donor_kind, auroc, n, n_pos
-
-File written by Amy Metrick in collaboration with Anthropic's Claude Science Opus 5 Agent
 """
 import argparse
 import os
