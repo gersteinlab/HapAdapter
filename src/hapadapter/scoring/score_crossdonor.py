@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-hapadapter.scoring.score_crossdonor -- cross-donor test set for HapAdapter head scoring
+hapadapter.scoring.score_crossdonor -- score HapAdapter head across heldout donors
 (both ref/alt and hap1/hap2 test sets supported)
 
 Writes one per-head CSV: assay, train_donor, eval_donor, arm, donor_kind, auroc, n, n_pos

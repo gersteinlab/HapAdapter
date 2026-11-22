@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """
-hapadapter.analysis.score_individual -- within-individual ASB-head scoring (both arms --ref and --personal supported)
+hapadapter.scoring.score_individual -- within-individual HapAdapter scoring
+(both ref/alt and hap1/hap2 test sets supported)
 
 NOTE: does NOT compute AUROC (within-individual AUROC read from the Trainer output eval_results.json)
 """
@@ -53,6 +54,8 @@ def eval_ref(args):
             kind = d["donor_kind"].iloc[0]
             print(f"[leakage] {int(d['leaky'].sum())}/{len(d)} {donor} ({kind}) in a seen bin "
                   f"({int(d.loc[d.label == 1, 'leaky'].sum())} positive)")
+        else:
+            print(f"[leakage] {donor}: NOT CHECKED (no --train_coords); leaky=0 is unverified")
 
         all_rows.append((d, pool_ref, pool_alt))
 
@@ -100,7 +103,7 @@ def eval_personal(args):
                                      "ref_start": df["anchor"].astype(int)}),
                        seen, args.bin_size, "chr", "ref_start", pos_is_1based=False)
     if not seen:
-        print("[leakage] WARNING: no --train_coords given -- leaky=False for every row is unverified! "
+        print("[leakage] WARNING: no --train_coords given -> leaky=0 for every row is unverified! "
               "Pass train.meta.csv dev.meta.csv to compute it.")
     else:
         print(f"[leakage] {int(leaky.sum())}/{len(df)} personal loci in a seen bin")
@@ -131,7 +134,7 @@ def parse_args():
     ap.add_argument("--hetsnv_tsv", default=None, help="hetSNVs.tsv (ref arm)")
     ap.add_argument("--assay", default="CTCF")
     ap.add_argument("--donors", nargs="+", default=["ENC-001", "ENC-002", "ENC-003", "ENC-004"])
-    ap.add_argument("--matched_donor", required=True,
+    ap.add_argument("--matched_donor", default=None,
                     help="the donor this head was TRAINED on; rows for it are labeled "
                          "donor_kind='matched', all others labeled 'cross-donor'")
     ap.add_argument("--min_total_reads", type=int, default=20)
@@ -145,6 +148,9 @@ def parse_args():
                          "train.meta.csv and dev.meta.csv. "
                          "Never pass test.meta.csv "
                          "-- that is the eval set, and it would flag every locus as leaky!")
+    ap.add_argument("--no_leak_check", action="store_true",
+                    help="run without --train_coords. The `leaky` column is then 0 for every "
+                         "row and UNVERIFIED.")
     ap.add_argument("--bin_size", type=int, default=100000)
     ap.add_argument("--left_bp", type=int, default=128)
     ap.add_argument("--right_bp", type=int, default=128)
@@ -155,14 +161,26 @@ def parse_args():
     ap.add_argument("--dump_embeddings", action="store_true",
                     help="also write {out}_pools.npz (raw ref/alt pools for probe scripts)")
     args = ap.parse_args()
+
     if args.arm == "ref":
         if not args.hetsnv_tsv:
             ap.error("--arm ref requires --hetsnv_tsv")
         if not args.ref_fasta:
             ap.error("--arm ref requires --ref_fasta")
+        if not args.matched_donor:
+            ap.error("--arm ref requires --matched_donor (it sets donor_kind)")
     else:
         if not args.windows_csv:
             ap.error("--arm personal requires --windows_csv")
+
+    if not args.train_coords:
+        if args.drop_leaky:
+            ap.error("--drop_leaky needs --train_coords: there is nothing to drop against. "
+                     "Pass the head's train.meta.csv and dev.meta.csv.")
+        if not args.no_leak_check:
+            ap.error("--train_coords is required so the `leaky` column means something. "
+                     "Pass the head's train.meta.csv and dev.meta.csv, or pass "
+                     "--no_leak_check to write unverified leaky=0 everywhere.")
 
     if args.overrides:
         import json

@@ -179,6 +179,31 @@ def build_windows(df, ref_fasta, left_bp, right_bp, chrom_col, pos_col, refbase_
 
     return seqs1, seqs2, np.array(keep, dtype=bool)
 
+def classification_metrics(ell, label):
+    ell = np.asarray(ell, dtype=float).reshape(-1)
+    y = np.asarray(label, dtype=float).reshape(-1)
+    yb = (y > 0.5).astype(int)
+    n = len(yb)
+    n_pos = int(yb.sum())
+    out = {
+        "bce": float(np.mean(np.logaddexp(0.0, ell) - yb * ell)), # BCE-with-logits
+        "n_pos": float(n_pos),
+        "pos_rate": float(n_pos / n) if n else float("nan"),
+    }
+    if 0 < n_pos < n:
+        from sklearn.metrics import matthews_corrcoef, precision_score, recall_score, f1_score
+        out["auroc"] = float(roc_auc_score(yb, ell))
+        out["auprc"] = float(average_precision_score(yb, ell))
+        pred = (ell > 0.0).astype(int)
+        out["mcc"] = float(matthews_corrcoef(yb, pred))
+        out["precision"] = float(precision_score(yb, pred, zero_division=0))
+        out["recall"] = float(recall_score(yb, pred, zero_division=0))
+        out["f1"] = float(f1_score(yb, pred, zero_division=0))
+    else:
+        for key in ("auroc", "auprc", "mcc", "precision", "recall", "f1"):
+            out[key] = float("nan")
+    return out
+
 def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20, verbose=None):
     # cover=None -> random balance
     # cover given -> COVERAGE-MATCHED balance:

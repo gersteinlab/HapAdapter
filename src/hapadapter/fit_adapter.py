@@ -280,15 +280,34 @@ def report_test(a, head, t, out_dir):
     print("\n  TEST")
     if t["cov"] is None:
         print(f"  no {a.cov_col!r} column in the test meta -- reporting the raw AUROC only.")
+    
+    pt_head = ci_head = kind_head = None
     for name, score in (("hapadapter head", ell),
                         ("||h1-h2|| (untrained)", np.linalg.norm(t["h1"] - t["h2"], axis=1))):
         pt, _, ci, m = balanced_auroc(score, y, cover=t["cov"], n_boot=a.n_boot, seed=a.seed)
         kind = "coverage-matched" if t["cov"] is not None else "unmatched"
         print(f"  {name:24}{pt:.4f}  CI [{ci[0]:.4f}, {ci[1]:.4f}]  n/class {m}  ({kind})")
+        if name == "hapadapter head":
+            pt_head, ci_head, kind_head = pt, ci, kind
 
     p = os.path.join(out_dir, "test_perlocus.csv")
     pd.DataFrame(dict(chr=t["chrom"], pos=t["pos"], ell=ell, label=y)).to_csv(p, index=False)
     print(f"[write] {p}")
+
+    from hapadapter.scoring.stats import classification_metrics
+    res = {f"eval_{k}": v for k, v in classification_metrics(ell, y).items()}
+    res["eval_auroc_balanced"] = float(pt_head)
+    res["eval_auroc_balanced_ci"] = [float(ci_head[0]), float(ci_head[1])]
+    res["eval_auroc_balanced_kind"] = kind_head
+    res["eval_n"] = int(len(y))
+    res["eval_split"] = "test"
+    res["_source"] = "hapadapter.fit_adapter.report_test"
+    rp = os.path.join(out_dir, "results", os.path.basename(os.path.abspath(out_dir)))
+    os.makedirs(rp, exist_ok=True)
+    ep = os.path.join(rp, "eval_results.json")
+    with open(ep, "w") as fh:
+        json.dump(res, fh, indent=2)
+    print(f"[write] {ep}  eval_auroc={res['eval_auroc']:.4f} (unbalanced, all {len(y)} rows)")
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

@@ -296,28 +296,7 @@ def calculate_multitrack_metrics(predictions, y, mask):
 
 # NEW: classification metrics ##################################################################################
 # NOTE: this function logically replaces original calculate_metric_with_sklearn function from DNABERT-2 train.py
-def calculate_classification_metrics(predictions: np.ndarray, labels: np.ndarray):
-    ell = np.asarray(predictions, dtype=float).reshape(-1)
-    y = np.asarray(labels, dtype=float).reshape(-1)
-    yb = (y > 0.5).astype(int)
-    n = len(yb); n_pos = int(yb.sum())
-    out = {
-        "bce": float(np.mean(np.logaddexp(0.0, ell) - yb * ell)), # BCE-with-logits, unweighted
-        "n_pos": float(n_pos),
-        "pos_rate": float(n_pos / n) if n else float("nan"),
-    }
-    if 0 < n_pos < n:
-        out["auroc"] = float(sklearn.metrics.roc_auc_score(yb, ell)) 
-        out["auprc"] = float(sklearn.metrics.average_precision_score(yb, ell))
-        pred = (ell > 0.0).astype(int)
-        out["mcc"] = float(sklearn.metrics.matthews_corrcoef(yb, pred))
-        out["precision"] = float(sklearn.metrics.precision_score(yb, pred, zero_division=0))
-        out["recall"] = float(sklearn.metrics.recall_score(yb, pred, zero_division=0))
-        out["f1"] = float(sklearn.metrics.f1_score(yb, pred, zero_division=0))
-    else:
-        for key in ("auroc", "auprc", "mcc", "precision", "recall", "f1"):
-            out[key] = float("nan")
-    return out
+from hapadapter.scoring.stats import classification_metrics as calculate_classification_metrics
 ##############################################################################################################
 
 # from: https://discuss.huggingface.co/t/cuda-out-of-memory-when-using-trainer-with-compute-metrics/2941/13
