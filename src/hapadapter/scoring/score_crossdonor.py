@@ -83,6 +83,7 @@ def _meta_coords(path):
         raise ValueError(f"{path}: need a chromosome column from ('chr', 'chrom') and a "
                          f"position column from ('SNV', 'pos', 'anchor', 'ref_start'); "
                          f"got {list(tc.columns)[:8]}")
+    return set(zip(tc[chrom_col].astype(str), tc[pos_col].astype(int)))
 
 def verify_folds(exp_root, assay, arm, train_donor, donors, bin_size, data_tpl=None):
     """
