@@ -2,27 +2,35 @@
 """
 hapadapter.interpret.dump_contrast_embeddings -- dump per-locus contrast representations
 
-  * (Stage 1) TRUNK contrast: h1 - h2      (pool_ref - pool_alt, dimension = d_model)
+  * TRUNK contrast: h1 - h2      (pool_ref - pool_alt, dimension = d_model)
         -- what the frozen trunk already produces, BEFORE the stage 2 learned projection
 
-  * (Stage 2) HEAD contrast: P(h1) - P(h2) (dimension = proj_dim)
+  * HEAD contrast: P(h1) - P(h2) (dimension = proj_dim)
 
-Also save: the model's twin classification logit ell (= a*s + b = logit P(ASB)) and the binary AS label
+Also save: the model's twin classification logit ell (= a*s + b = logit P(AS)) and the binary AS label
 (if the input CSV carries total_reads / chr / anchor, they are also passed through to enable leak filtering)
 
 Input:
-a Stage-2 build CSV (columns: sequence1, sequence2, label[, depth])
+a HapAdapter build CSV (columns: sequence1, sequence2, label[, depth])
 OR an ASB-windows CSV (sequence1, sequence2, as_label, total_reads, chr, anchor)
-
-File written by Amy Metrick in collaboration with Anthropic's Claude Science Opus 5 Agent
 """
 import argparse, csv, os, sys
 import numpy as np
 
 def _write_npz(out_path, *, labels, ell, trunk_contrast, head_contrast, total_reads,
                chrom, anchor, checkpoint_dir, data_csv, extra):
+    n = len(labels)
+    wrong = [f"{nm} ({len(v)})" for nm, v in
+             (("ell", ell), ("trunk_contrast", trunk_contrast), ("head_contrast", head_contrast),
+              ("total_reads", total_reads), ("chrom", chrom), ("anchor", anchor))
+             if len(v) != n]
+    if wrong:
+        raise SystemExit(f"row mismatch against {n} labels: {', '.join(wrong)}. A selection "
+                         f"step (restrict / subsample) filtered some arrays and not others.")
+    # tmp + replace in cash of mid-run crash
+    tmp = out_path + ".tmp.npz"
     np.savez_compressed(
-        out_path,
+        tmp,
         labels=np.asarray(labels).astype(np.int8),
         ell=np.asarray(ell, dtype=np.float32),
         trunk_contrast=np.asarray(trunk_contrast, dtype=np.float32),
@@ -36,6 +44,7 @@ def _write_npz(out_path, *, labels, ell, trunk_contrast, head_contrast, total_re
         data_csv=np.array(data_csv),
         **extra,
     )
+    os.replace(tmp, out_path)
     print(f"[write] {out_path}")
 
 def _cached(args):
@@ -53,14 +62,16 @@ def _cached(args):
             f"{args.checkpoint_dir} is a {cfg.get('head_variant')!r} head. "
             f"Only pass twin (contrast) heads here.")
 
-    xf = cfg.get("cache_transform")
+    xf = args.cache_transform or cfg.get("cache_transform")
     if xf is None:
         raise SystemExit(
             f"{args.checkpoint_dir}/run_config.json records no 'cache_transform', so the "
             f"embedding preprocessing used at fit time cannot be reproduced. Pass "
             f"--cache_transform explicitly if you know what the fit used.")
-    if args.cache_transform:
-        xf = args.cache_transform
+    if args.cache_transform and cfg.get("cache_transform") not in (None, args.cache_transform):
+        print(f"[warn] --cache_transform {args.cache_transform!r} overrides the "
+              f"{cfg['cache_transform']!r} recorded in the head's run_config. The recorded "
+              f"value is what the head was trained under.")
 
     split = load_cached_split(args.cache, args.pair_csv, args.meta_csv, args.label_col,
                               "depth", "depth", xf, "dump", 0.0)
@@ -221,10 +232,14 @@ def main():
         else:
             n_neg_keep = max(0, args.max_rows - len(pos))
             mode = f"--max_rows {args.max_rows}"
+
         neg_keep = rng.choice(neg, size=min(n_neg_keep, len(neg)), replace=False)
         idx = np.sort(np.concatenate([pos, neg_keep]))
         rows = [rows[i] for i in idx]
         labels = labels[idx]
+
+        if coord is not None:
+            coord = [coord[i] for i in idx]
 
         print(f"[subsample] {mode} -> kept {len(rows)} rows "
               f"({int((labels==1).sum())} pos, {int((labels==0).sum())} neg)")
@@ -247,7 +262,7 @@ def main():
         args.checkpoint_dir, texts, batch_size=args.batch_size,
         device=args.device, dump_pools=True)
 
-    logits = np.asarray(logits, dtype=np.float32).reshape(-1)     # ell = logit P(ASB)
+    logits = np.asarray(logits, dtype=np.float32).reshape(-1)     # ell = logit P(AS)
     head_contrast = np.asarray(emb, dtype=np.float32)             # (N, proj_dim)
     pool_ref = np.asarray(pool_ref, dtype=np.float32)             # (N, H)
     pool_alt = np.asarray(pool_alt, dtype=np.float32)             # (N, H)
