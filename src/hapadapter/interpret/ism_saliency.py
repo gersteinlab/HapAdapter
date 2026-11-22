@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 """
-hapadapter.analysis.ism_saliency -- calculates ISM saliency from any entexBERT-2 checkpoint
+hapadapter.interpret.ism_saliency -- calculates ISM saliency from any HapAdapter checkpoint
 
-* regression  (Stage-1 binding trunk):  single-seq forward, target = binding score mu
+* regression (a fine-tuned trunk):  single-seq forward, target = binding score mu
     delta[w, i, b] = mu(sequence window w with position i mutated to base b) - mu(reference sequence window w)
     => importance[w, i] = -mean_{b != ref nucleotide} delta[w, i, b]
     * negative sign since mutating away from ref nucleotide hurts binding 
         (so delta[w, i, b] < 0 but should have importance[w, i] > 0) *
 
-* classification (Stage-2 ASB head): twin forward
+* classification (HapAdapter ASB head): twin forward
     ell = a*||z1 - z2|| + b (baseline ell(ref, ref) is minimum contrast)
     delta[w,i,b] = ell(mut,ref) - ell(ref,ref)
     importance[w, i] = +mean_{b != ref nucleotide} delta[w, i, b]
@@ -20,7 +20,7 @@ import argparse, numpy as np, pandas as pd
 BASES = "ACGT"
 B2I = {b: i for i, b in enumerate(BASES)}
 
-# For Stage-1 checkpoints
+# for fine-tuned trunk checkpoints
 def build_mutant_list(seqs):
     """Flatten [ref, all single mutants] with an index of (window, pos, base_idx); baseline: pos = -1"""
     inputs, index = [], []
@@ -34,7 +34,7 @@ def build_mutant_list(seqs):
                 index.append((w, i, B2I[b]))
     return inputs, index
 
-# For Stage-2 checkpoints
+# for HapAdapter ASB head checkpoints
 def build_mutant_pairs(seqs, partners=None):
     """
     Twin-ISM inputs: mutate window1, hold window2 fixed
@@ -69,6 +69,11 @@ def assemble(seqs, index, scores, task):
     for (w, i, b), sc in zip(index, scores):
         if i == -1:
             base[w] = sc
+    if np.isnan(base).any():
+        missing = np.flatnonzero(np.isnan(base))
+        raise SystemExit(f"{len(missing)} of {N} windows have no baseline score "
+                         f"(first: window {int(missing[0])}); the index and the scores are "
+                         f"out of step.")
     for (w, i, b), sc in zip(index, scores):
         if i == -1:
             continue
@@ -119,11 +124,25 @@ def main():
           f"{'binding-trunk (single-seq mu)' if task == 'regression' else 'twin/head (ASB logit ell)'} ISM")
 
     df = pd.read_csv(a.windows_csv)
+    for flag, val in (("--feature_col", a.feature_col), ("--rank_col", a.rank_col)):
+        if val in df.columns:
+            continue
+        if val != ap.get_default(flag.lstrip("-")):
+            raise SystemExit(f"{flag} {val!r} is not a column of {a.windows_csv}; "
+                             f"columns are {list(df.columns)}")
+        print(f"[warn] no {val!r} column -- {flag} not applied "
+              f"({'all rows kept' if flag == '--feature_col' else 'rows kept in file order'})")
     if a.feature_col in df.columns:
+        n0 = len(df)
         if a.feature_exact:
             df = df[df[a.feature_col].astype(str).str.strip() == a.feature_keep]
         else:
             df = df[df[a.feature_col].astype(str).str.contains(a.feature_keep, case=False, na=False)]
+        print(f"[ISM] {a.feature_col} {'==' if a.feature_exact else 'contains'} "
+              f"{a.feature_keep!r}: kept {len(df)}/{n0} rows")
+        if df.empty:
+            raise SystemExit(f"--feature_keep {a.feature_keep!r} matched no rows; values are "
+                             f"{sorted(set(pd.read_csv(a.windows_csv)[a.feature_col].astype(str)))[:8]}")
     if a.rank_col in df.columns:
         df = df.sort_values(a.rank_col, ascending=False)
 
@@ -167,9 +186,24 @@ def main():
     arr = assemble(seqs, index, scores, task)
     tb = a.twin_baseline if task == "classification" else "n/a"
 
-    # carry per-window metadata (coords + depth + label) in seqs order
-    meta = {c: df[c].to_numpy() for c in ("chr", "anchor", "total_reads", "as_label") if c in df.columns}
-    np.savez_compressed(a.out, seqs=np.array(seqs), task=task, twin_baseline=tb, **arr, **meta)
+    # carry per-window metadata (coords + depth + label + window geometry) in seqs order
+    meta = {c: df[c].to_numpy() for c in ("chr", "anchor", "total_reads", "as_label",
+                                          "variant_index", "window_len") if c in df.columns}
+    if "variant_index" not in meta:
+        print("[warn] the windows CSV has no 'variant_index' column, so this npz cannot say "
+              "where the variant sits.")
+    elif int(meta["variant_index"][0]) != L // 2:
+        print(f"[ISM] JITTERED windows: variant at index {int(meta['variant_index'][0])} of "
+              f"L={L} (centre {L // 2}), offset {int(meta['variant_index'][0]) - L // 2:+d} bp")
+
+    # atomic write in case of a crash mid-run
+    import os
+    if os.path.dirname(a.out):
+        os.makedirs(os.path.dirname(a.out), exist_ok=True)
+    tmp = a.out + ".tmp.npz"
+    np.savez_compressed(tmp, seqs=np.array(seqs), task=task, twin_baseline=tb, **arr, **meta)
+    os.replace(tmp, a.out)
+
     imp = arr["importance"]
     print(f"[ISM] saved -> {a.out} | task={task} | importance range [{imp.min():.3f},{imp.max():.3f}] "
           f"mean per-window peak {imp.max(axis=1).mean():.3f}")
