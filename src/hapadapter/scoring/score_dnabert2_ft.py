@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-hapadapter.scoring.score_dnabert2_ft -- DNABERT-2 (fine-tuned) forward pass on each hap and predictions differenced
+hapadapter.scoring.score_dnabert2_ft -- DNABERT-2 (fine-tuned) forward pass on each hap (or ref/alt) and predictions differenced
 """
 import argparse
+import json
 import os
 import sys
 
@@ -10,15 +11,67 @@ import numpy as np
 import pandas as pd
 
 def resolve_coords(meta, path, chrom_col=None, pos_col=None):
-    """(chrom, pos) arrays from a build's meta CSV"""
-    cc = chrom_col or ("chr" if "chr" in meta.columns else
-                       next((c for c in ("chrom", "chromosome") if c in meta.columns), None))
-    pc = pos_col or next((c for c in ("anchor", "pos", "ref_start", "SNV") if c in meta.columns), None)
+    """
+    (chrom, pos) column names from a build's meta CSV
+    """
+    from hapadapter.backbones.cache import resolve_coord_columns
+    if chrom_col and pos_col:
+        return chrom_col, pos_col
+    try:
+        cc, pc = resolve_coord_columns(meta, path)
+        return chrom_col or cc, pos_col or pc
+    except (ValueError, SystemExit):
+        pass
+    cc = chrom_col or next((c for c in ("chr", "chrom", "chromosome")
+                            if c in meta.columns), None)
+    pc = pos_col or next((c for c in ("anchor", "ref_start", "pos", "SNV")
+                          if c in meta.columns), None)
     if cc is None or pc is None:
         raise SystemExit(
             f"{path}: cannot resolve coordinate columns (chrom={cc!r}, pos={pc!r}); "
-            f"present: {list(meta.columns)}. Pass --chrom_col/--pos_col.")
+            f"present: {list(meta.columns)}. Please pass --chrom_col/--pos_col explicitly.")
+    print(f"[coords] {path}: resolved {cc!r}/{pc!r} by this script's extended list -- the "
+          f"package resolver does not know these spellings, so check that whatever joins "
+          f"this output uses the same column.")
     return cc, pc
+
+def preflight_checkpoint(checkpoint_dir):
+    """
+    Refuse an unusable checkpoint before the forward pass
+    """
+    rcp = os.path.join(checkpoint_dir, "run_config.json")
+    if not os.path.exists(rcp):
+        print(f"[preflight] no run_config.json in {checkpoint_dir}; the task and track-count "
+              f"checks will run after the forward pass instead.")
+        return None
+    with open(rcp) as fh:
+        rc = json.load(fh)
+    task = str(rc.get("task", "")).lower()
+    if task and task != "regression":
+        raise SystemExit(
+            f"FATAL: {checkpoint_dir} has task={task!r}. This script is currently "
+            f"only built for a trunk fine-tuned with a regression head.")
+    if int(rc.get("num_labels", 1)) > 1:
+        raise SystemExit(
+            f"FATAL: {checkpoint_dir} is a MULTI-TRACK trunk (run_config "
+            f"num_labels={rc.get('num_labels')}). This script is currently only built for "
+            f"a trunk fine-tuned with a SINGLE-TRACK regression head.")
+    print(f"[preflight] {os.path.basename(checkpoint_dir)}: task={task or 'unset'} "
+          f"num_labels={rc.get('num_labels', 1)} -- usable")
+    return rc
+
+def check_output_width(checkpoint_dir, rc, n_out):
+    """The ACTUAL output width, reported by a forward pass"""
+    if int(rc.get("num_labels", 1)) > 1 or n_out > 1:
+        raise SystemExit(
+            f"FATAL: {checkpoint_dir} is a MULTI-TRACK trunk (run_config "
+            f"num_labels={rc.get('num_labels')}, output width {n_out}). This script is "
+            f"currently only built for a trunk fine-tuned with a SINGLE-TRACK regression head.")
+    task = str(rc.get("task", "")).lower()
+    if task and task != "regression":
+        raise SystemExit(
+            f"FATAL: {checkpoint_dir} has task={task!r}. This script is currently "
+            f"only built for a trunk fine-tuned with a regression head.")
 
 def main():
     from hapadapter.loading import run_inference
@@ -50,6 +103,7 @@ def main():
         if c not in pair.columns:
             raise SystemExit(f"{a.pair_csv}: no {c!r} column; present: {list(pair.columns)}.")
     cc, pc = resolve_coords(meta, a.meta_csv, a.chrom_col, a.pos_col)
+    preflight_checkpoint(a.checkpoint_dir)
 
     if a.limit:
         pair, meta = pair.head(a.limit), meta.head(a.limit)
@@ -65,7 +119,7 @@ def main():
     if n_ident == n:
         raise SystemExit(
             f"FATAL: sequence1 == sequence2 at ALL {n:,} loci. Check to see if "
-            f"you accidentally input reference (instead of personal) windows!")
+            f"you accidentally input two identical reference windows or the same haplotype twice!")
     if n_ident:
         # may get some that line up due to indels (not necessarily an issue)
         print(f"[warn] {n_ident:,} of {n:,} loci ({n_ident/n:.1%}) have identical haplotype windows.")
@@ -75,16 +129,7 @@ def main():
     arr = np.asarray(logits, dtype=float)
     n_out = arr.shape[1] if arr.ndim > 1 else 1
 
-    task = str(rc.get("task", "")).lower()
-    if task and task != "regression":
-        raise SystemExit(
-            f"FATAL: {a.checkpoint_dir} has task={task!r}. This script is currently "
-            f"only built for a trunk fine-tuned with a regression head.")
-    if int(rc.get("num_labels", 1)) > 1 or n_out > 1:
-        raise SystemExit(
-            f"FATAL: {a.checkpoint_dir} is a MULTI-TRACK trunk (run_config "
-            f"num_labels={rc.get('num_labels')}, output width {n_out}). This script is "
-            f"currently only built for a trunk fine-tuned with a SINGLE-TRACK regression head.")
+    check_output_width(a.checkpoint_dir, rc, n_out)
     if arr.shape[0] != 2 * n:
         raise SystemExit(f"FATAL: expected {2*n:,} predictions for {n:,} loci x 2 haplotypes, "
                          f"got {arr.shape[0]:,}. The loader did not score one window per input.")
