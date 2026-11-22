@@ -40,7 +40,7 @@ def main():
         print(f"[skip] {_out} exists (use --overwrite)")
         return
 
-    from hapadapter.backbones.cache import pair_key, write_pair_cache
+    from hapadapter.backbones.cache import pair_key, resolve_coord_columns, write_pair_cache
     from hapadapter.trunk.loading import build_model, load_tokenizer
 
     with open(a.trunk_config) as f:
@@ -52,17 +52,25 @@ def main():
 
     if missing:
         raise SystemExit(f"{a.trunk_config} has no {missing} -- cannot guarantee the raw bar is "
-                         f"pooled like the fine-tuned bar. Please pass a trunk config that has it.")
-    print(f"[pool] copied from trunk config: {pooling}")
+                         f"pooled like the fine-tuned bar. Please pass a trunk config that has it!")
+    print(f"[pool] reference pooling from {os.path.basename(a.trunk_config)}: {pooling}")
 
     rc = dict(model_name_or_path=a.raw_dir, task="regression", num_labels=1,
-              head_num_layers=1, head_hidden_size=-1, head_variant="single", **pooling)
+              head_num_layers=1, head_hidden_size=-1, **pooling)
     rc.setdefault("center_pool_width", 5)
 
     if a.checkpoint_dir: # fine-tuned
         from hapadapter.loading import load_model_and_tokenizer
         model, tok, rc = load_model_and_tokenizer(a.checkpoint_dir, device=a.device)
         src_desc = f"fine-tuned checkpoint {a.checkpoint_dir}"
+        differs = {k: (pooling[k], rc.get(k)) for k in pooling if rc.get(k) != pooling[k]}
+        if differs:
+            raise SystemExit(
+                "--checkpoint_dir pools differently from --trunk_config: "
+                + "; ".join(f"{k}: checkpoint={ck!r} trunk_config={tk!r}"
+                            for k, (tk, ck) in differs.items())
+                + ". Please pass the run_config.json of the trunk this "
+                "checkpoint was fitted on.")
     else: # raw pre-trained
         model = build_model(rc, device=a.device)
         tok = load_tokenizer(rc)
@@ -109,10 +117,7 @@ def main():
             raise SystemExit(f"{a.pair_csv} has no '{c}'; present: {list(df.columns)[:12]}. "
                              f"A hap_pair build is required.")
 
-    cc = "chr" if "chr" in meta.columns else "chrom"
-    pc = next((c for c in ("anchor", "pos", "ref_start") if c in meta.columns), None)
-    if pc is None:
-        raise SystemExit(f"{a.pair_meta} has no anchor/pos/ref_start; present: {list(meta.columns)}")
+    cc, pc = resolve_coord_columns(meta, a.pair_meta)
 
     # pool embeddings
     @torch.no_grad()
@@ -131,15 +136,14 @@ def main():
 
     if a.restrict_loci:
         if a.restrict_loci.endswith(".npz"):
-            _d = np.load(a.restrict_loci, allow_pickle=True)
-            want = set()
-            for k in np.asarray(_d["keys"]).astype(str):
-                _c, _p, _h = k.rsplit(":", 2)
-                want.add((_c, int(_p)))
+            with np.load(a.restrict_loci, allow_pickle=True) as _d:
+                want = set()
+                for k in np.asarray(_d["keys"]).astype(str):
+                    _c, _p, _h = k.rsplit(":", 2)
+                    want.add((_c, int(_p)))
         else:
             _t = pd.read_csv(a.restrict_loci)
-            _cc = "chr" if "chr" in _t.columns else _t.columns[0]
-            _pc = next(c for c in ("pos", "anchor") if c in _t.columns)
+            _cc, _pc = resolve_coord_columns(_t, a.restrict_loci)
             want = set(zip(_t[_cc].astype(str), _t[_pc].astype(int)))
         sel = np.array([(str(c), int(p)) in want for c, p in zip(meta[cc], meta[pc])])
         if not sel.any():
