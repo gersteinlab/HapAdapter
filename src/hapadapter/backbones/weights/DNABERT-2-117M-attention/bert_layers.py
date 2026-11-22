@@ -5,6 +5,11 @@
 # Copyright (c) 2018-2021, NVIDIA CORPORATION.  All rights reserved.
 # Copyright (c) 2022, Tri Dao.
 
+####################################################################################################
+# File modified by Amy Metrick to allow for extraction of attention scores with ALiBi biases removed
+# All changes marked with a "NEW" comment
+####################################################################################################
+
 import copy
 import logging
 import math
@@ -18,7 +23,7 @@ from torch.nn.modules.utils import consume_prefix_in_state_dict_if_present
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import (MaskedLMOutput,
                                            SequenceClassifierOutput,
-                                           BaseModelOutputWithPooling) # NEW
+                                           BaseModelOutputWithPooling) # NEW: so BertModel can return an HF output object instead of a bare tuple when return_dict=True
 from transformers.models.bert.modeling_bert import BertPreTrainedModel
 from transformers.modeling_utils import PreTrainedModel
 
@@ -132,7 +137,7 @@ class BertUnpadSelfAttention(nn.Module):
     def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor,
                 max_seqlen_in_batch: int, indices: torch.Tensor,
                 attn_mask: torch.Tensor, bias: torch.Tensor,
-                padding_bias: Optional[torch.Tensor] = None,  # NEW: padding-only bias (no ALiBi) for reported attn
+                padding_bias: Optional[torch.Tensor] = None, # NEW: padding-only bias (no ALiBi)
                 output_attentions: Optional[bool] = False) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Perform self-attention.
 
@@ -175,7 +180,7 @@ class BertUnpadSelfAttention(nn.Module):
             attention_probs = self.dropout(attention_probs)
             attention = torch.matmul(attention_probs, v).permute(0, 2, 1,
                                                                  3)  # b s h d
-            # NEW: for reporting, recompute attention WITHOUT the ALiBi positional bias, at full precision
+            # NEW: for analysis, recompute attention WITHOUT the ALiBi positional bias, at full precision
             # Note that the model's own output above is UNCHANGED (still uses content+ALiBi+padding)
             if output_attentions:
                 if padding_bias is not None:
