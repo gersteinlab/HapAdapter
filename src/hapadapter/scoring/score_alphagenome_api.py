@@ -21,7 +21,7 @@ def _client(api_key):
         except ImportError:
             continue
     if mod is None:
-        raise SystemExit("could not import dna_client from alphagenome.models{,.v1,.v2} -- "
+        raise SystemExit("Could not import dna_client from alphagenome.models{,.v1,.v2} -- "
                          "check the installed alphagenome version")
     return mod, mod.create(api_key)
 
@@ -52,6 +52,11 @@ ASSAY_MAP = {
 ENCODE_NAME = {"ctcf": "CTCF", "polr2a": "POLR2A", "h3k4me3": "H3K4me3", "h3k4me1": "H3K4me1",
                "h3k27ac": "H3K27ac", "h3k9me3": "H3K9me3", "h3k27me3": "H3K27me3",
                "h3k36me3": "H3K36me3", "atac": "ATAC"}
+
+KEY_VERSION = "v2"
+def cache_key(chrom, pos, a, seq_len, track_col, keep):
+    return (f"{chrom}:{int(pos)}:{a.assay}:{seq_len}:{a.mask_width}:{a.organism.upper()}"
+            f":{track_col or 'none'}:{a.ontology or 'all'}:{int(keep.sum())}:{KEY_VERSION}")
 
 def select_tracks(md, assay, track_col, label):
     """Row mask over the track metadata"""
@@ -101,7 +106,7 @@ def main():
     ap.add_argument("--mask_width", type=int, default=501,
                     help="center window in bp; the effective width is reported, since output "
                          "can be binned and the real span is a multiple of the bin size")
-    ap.add_argument("--limit", type=int, default=0, help="only score  N loci to test setup (0 -> all)")
+    ap.add_argument("--limit", type=int, default=0, help="only score N loci to test setup (0 -> all)")
     ap.add_argument("--organism", default="HOMO_SAPIENS")
     a = ap.parse_args()
 
@@ -113,7 +118,7 @@ def main():
 
     key = os.environ.get("ALPHAGENOME_API_KEY")
     if not key:
-        raise SystemExit("ALPHAGENOME_API_KEY is not set")
+        raise SystemExit("ALPHAGENOME_API_KEY is not set in this environment")
 
     pair = pd.read_csv(a.pair_csv)
     meta = pd.read_csv(a.meta_csv)
@@ -125,15 +130,18 @@ def main():
 
     if a.restrict_loci:
         if a.restrict_loci.endswith(".npz"):
-            d = np.load(a.restrict_loci, allow_pickle=True)
+            with np.load(a.restrict_loci, allow_pickle=True) as d:
+                if "keys" not in d.files:
+                    raise SystemExit(f"{a.restrict_loci}: not a pair cache (no 'keys'); "
+                                     f"has {list(d.files)}")
+                rk = np.asarray(d["keys"]).astype(str)
             want = set()
-            for k in np.asarray(d["keys"]).astype(str):
+            for k in rk:
                 c, p, _h = k.rsplit(":", 2)
                 want.add((c, int(p)))
         else:
             t = pd.read_csv(a.restrict_loci)
-            tcc = "chr" if "chr" in t.columns else t.columns[0]
-            tpc = next(c for c in ("pos", "anchor") if c in t.columns)
+            tcc, tpc = resolve_coord_columns(t, f"{a.restrict_loci} (--restrict_loci)")
             want = set(zip(t[tcc].astype(str), t[tpc].astype(int)))
         sel = np.array([(str(c), int(p)) in want for c, p in zip(meta[cc], meta[pc])])
         if not sel.any():
@@ -192,10 +200,13 @@ def main():
 
     done = {}
     if a.cache and os.path.exists(a.cache):
-        z = np.load(a.cache, allow_pickle=True)
-        done = {k: (float(s1), float(s2)) for k, s1, s2
-                in zip(np.asarray(z["keys"]).astype(str), z["s1"], z["s2"])}
+        with np.load(a.cache, allow_pickle=True) as z:
+            done = {k: (float(s1), float(s2)) for k, s1, s2
+                    in zip(np.asarray(z["keys"]).astype(str), z["s1"], z["s2"])}
         print(f"[cache] {len(done)} loci already scored")
+        stale = sum(1 for k in done if not k.endswith(KEY_VERSION))
+        if stale:
+            print(f"[cache] {stale} of {len(done)} entries lack a key and will be re-scored.")
 
     def score(seq):
         out = client.predict_sequence(sequence=seq, organism=organism, requested_outputs=[ot], ontology_terms=None)
@@ -210,8 +221,7 @@ def main():
     n_amb, amb_chars = 0, set()
 
     for i, (r, m) in enumerate(zip(pair.itertuples(index=False), meta.itertuples(index=False))):
-        k = (f"{getattr(m, cc)}:{int(getattr(m, pc))}:{a.assay}:{a.mask_width}"
-             f":{a.ontology or 'all'}:{int(keep.sum())}")
+        k = cache_key(getattr(m, cc), getattr(m, pc), a, seq_len, track_col, keep)
         if k in done:
             s1, s2 = done[k]
         else:
@@ -242,8 +252,9 @@ def main():
     out.to_csv(a.out_csv, index=False)
 
     if n_amb:
-        print(f"\n[ambiguity] {n_amb} of {2*len(out)} windows contained non-ACGTN bases "
-              f"{sorted(amb_chars)[:6]} -- those positions re-encoded as N and will be masked.")
+        print(f"\n[ambiguity] {n_amb} of {2*n_new} newly scored windows contained non-ACGTN "
+              f"bases {sorted(amb_chars)[:6]} -- those positions re-encoded as N and masked. "
+              f"Cached loci were not re-checked, so this is not a count over the whole file.")
 
     if eff_bp is None:
         print(f"\n[mask] requested {a.mask_width} bp -> effective width NOT MEASURED this run "
