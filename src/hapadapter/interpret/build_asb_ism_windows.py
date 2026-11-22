@@ -1,22 +1,23 @@
 #!/usr/bin/env python
 """
-hapadapter.analysis.build_asb_ism_windows -- build AS/non-AS CSVs for ISM from a given eval set
-
-Each output row carries the same twin windows the model scored (score_individual.build_windows):
-  sequence1 = reference/hap1 window  (allele1 substituted at the center of a 257bp hg38 window)
-  sequence2 = alt/hap2 window        (allele2 at the center; the twin partner)
-  as_label  = "AS" or "nonAS"        (feature column ism_saliency filters on)
-  total_reads = per-locus read depth (coverage covariate)
-  chr, anchor = chromosome + 0-based variant-center coordinate  (for the position-shortcut check)
-
-** A Stage-1 ref-embedding probe reads sequence1 (the reference window) as the single-seq input **
-
-File written by Amy Metrick in collaboration with Anthropic's Claude Science Opus 5 Agent
+hapadapter.interpret.build_asb_ism_windows -- build AS/non-AS CSVs for ISM from a given eval set
+** can also run on only one reference window for ISM on fine-tuned trunks **
 """
 
 import argparse, os, numpy as np, pandas as pd
 from pyfaidx import Fasta
 from hapadapter.scoring.stats import load_hetsnv, build_windows, seen_bins_from_meta, flag_leaky
+
+def offset_from_center(left_bp, right_bp):
+    """
+    For jitter control experiments
+    """
+    d = left_bp - right_bp
+    if d % 2:
+        raise SystemExit(f"--left_bp {left_bp} / --right_bp {right_bp} differ by an odd number, "
+                         f"so the variant cannot sit on an integer offset from the center of a "
+                         f"{left_bp + right_bp + 1} bp window. Use offsets of the same parity.")
+    return d // 2
 
 def load_restrict(pv_csv, drop_leaky=True):
     """
@@ -120,7 +121,8 @@ def build_entex(ref_fasta, tsv, assay, donor, min_total_reads, left_bp, right_bp
         if s1 is None:
             continue
         rows.append((s1, s2, "AS" if int(r["imbalance_significance"]) == 1 else "nonAS",
-                     float(r["total_reads"]), str(r["chr"]), int(r["ref_start"])))
+                     float(r["total_reads"]), str(r["chr"]), int(r["ref_start"]),
+                     left_bp, left_bp + right_bp + 1))
 
     if pg is not None:
         print(f"[personal] allele-match rate = {pg.match_rate():.3f} "
@@ -131,7 +133,8 @@ def build_entex(ref_fasta, tsv, assay, donor, min_total_reads, left_bp, right_bp
     if lift_fail:
         print(f"[personal] lift failures by reason: {lift_fail}")
 
-    return pd.DataFrame(rows, columns=["sequence1", "sequence2", "as_label", "total_reads", "chr", "anchor"])
+    return pd.DataFrame(rows, columns=["sequence1", "sequence2", "as_label", "total_reads",
+                                       "chr", "anchor", "variant_index", "window_len"])
 
 def main():
     ap = argparse.ArgumentParser()
@@ -163,7 +166,13 @@ def main():
 
     if not a.hetsnv_tsv:
         raise SystemExit("ERROR: --hetsnv_tsv is required (it is the only input this builds from).")
-    
+
+    if not a.assay:
+        raise SystemExit("ERROR: --assay is required -- pass an assay name or ALL "
+                         "to pool every assay in the table.")
+
+    restrict = load_restrict(a.restrict_coords) if a.restrict_coords else None
+
     pg = None
     if a.sequence_mode == "personal":
         from hapadapter.data.personal_seq import PersonalGenome, parse_chain_file
@@ -173,17 +182,22 @@ def main():
                 raise SystemExit(f"--sequence_mode personal requires --{name}")
         pg = PersonalGenome(parse_chain_file(a.mat_chain), Fasta(a.hap1_fa),
                             parse_chain_file(a.pat_chain), Fasta(a.hap2_fa), donor=a.donor)
-    restrict = load_restrict(a.restrict_coords) if a.restrict_coords else None
 
     d = build_entex(a.ref_fasta, a.hetsnv_tsv, a.assay, a.donor, a.min_total_reads,
             a.left_bp, a.right_bp, pg=pg, restrict=restrict,
             train_coords=a.train_coords, bin_size=a.bin_size)
 
     suffix = "_personal" if a.sequence_mode == "personal" else ""
-    out = os.path.join(a.outdir, f"{tf}_asb_ism_windows_entex{suffix}.csv")
-    d.to_csv(out, index=False)
+    off = offset_from_center(a.left_bp, a.right_bp)
+    tag = "" if off == 0 else f"_off{off:+d}"
+    out = os.path.join(a.outdir, f"{tf}_asb_ism_windows_entex{suffix}{tag}.csv")
+    tmp = out + ".tmp"
+    d.to_csv(tmp, index=False)
+    os.replace(tmp, out)
     vc = d["as_label"].value_counts().to_dict()
-    print(f"[entex:{a.sequence_mode}] wrote {out}: {len(d)} loci {vc}")
+    print(f"[ISM {a.sequence_mode}] wrote {out}: {len(d)} loci {vc} | "
+          f"window {a.left_bp + a.right_bp + 1} bp, variant at index {a.left_bp} "
+          f"(center{off:+d})")
 
 if __name__ == "__main__":
     main()
