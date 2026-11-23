@@ -14,8 +14,6 @@ The Stage-2 ASB head reads this table via the hap_counts row source where
     * n = the per-locus depth (privileged precision weight n_eff)
     * imbalance_significance = the binary AS label
     * chr/ref_start are for the leakage split
-
-File written by Amy Metrick in collaboration with Anthropic's Claude Science Opus 5 Agent
 """
 
 import argparse, re

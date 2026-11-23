@@ -1,5 +1,5 @@
 """
-hapadapter.build_inputs -- dataset construction for predicting binding (regression) and ASB (classification)
+hapadapter.data.build_inputs -- dataset construction for predicting binding (regression) and ASB (classification)
 
 Driven by two classes:
 1. RowSource (sequence)
@@ -14,6 +14,7 @@ New sources/labels can be added by:
 """
 
 import os
+import re
 import hashlib
 import pandas as pd
 import numpy as np
@@ -760,7 +761,9 @@ def add_sequence_inputs(
     anchor2s, fstart2s, fend2s = [], [], []
 
     keep_pos = []
-    n_dropped_personal = 0 # dropped rows in reference -> personal liftover
+    n_dropped_personal = 0  # unliftable or allele-mismatched in reference -> personal lift
+    n_no_genome = 0         # donor has no PersonalGenome (config error, counted separately)
+
     _stats_before = ({d: dict(g.stats) for d, g in personal_genomes.items()}
                      if sequence_mode == "personal" else None)
 
@@ -772,8 +775,6 @@ def add_sequence_inputs(
         end = int(row["bed_end"])
         snv = int(row["anchor"])
         a2 = s2 = e2 = None
-        n_dropped_personal = 0 # dropped rows in reference -> personal liftover
-        n_no_genome = 0 # rows whose donor has no PersonalGenome (a CONFIG error, not a lift failure)
 
         ref_seq = str(ref_fasta[chrom][start:end]).upper()
 
@@ -806,7 +807,7 @@ def add_sequence_inputs(
             donor = str(row["donor"]) if has_donor_col else next(iter(personal_genomes))
             pg = personal_genomes.get(donor)
             if pg is None:
-                n_dropped_personal += 1
+                n_no_genome += 1
                 continue
             res, _err = pg.pair_windows(chrom, snv, hap1_allele, hap2_allele,
                                         left=snv_offset, right=(end - snv - 1))
@@ -815,9 +816,6 @@ def add_sequence_inputs(
                 continue
             hap1_seq = res["seq1"] if needs_hap1 else None
             hap2_seq = res["seq2"] if needs_hap2 else None
-            if pg is None:
-                n_no_genome += 1
-                continue
         else:
             hap1_seq = make_haplotype_sequence(ref_seq, snv_offset, hap1_allele) if needs_hap1 else None
             hap2_seq = make_haplotype_sequence(ref_seq, snv_offset, hap2_allele) if needs_hap2 else None
@@ -1176,11 +1174,11 @@ class BigWigSignalAnnotator:
             self.bw.close()
             self.bw = None
 
-            def __del__(self):
-                try:
-                    self.close()
-                except Exception:
-                    pass
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _query_region_from_row(self, row: pd.Series):
         chrom = row["chr"]
@@ -1365,9 +1363,14 @@ class HaplotypeCountRowSource(RowSource):
                 raise ValueError(
                     f"hap_counts source: {_attr}={_want!r} requested but {self.counts_csv} has no "
                     f"{_col!r} column! Have: {sorted(df.columns)}")
-            if _col == "assay":   # case-insensitive substring (POLR2AphosphoS5 etc.)
-                df = df[df[_col].astype(str).str.contains(str(_want), case=False, na=False)]
-            else:                 # donor: exact match
+            if _col == "assay": # right-hand word boundary (e.g. for catching POLR2A vs POLR2AphosphoS5)
+                _pat = re.escape(str(_want)) + r"(?![A-Za-z0-9])"
+                df = df[df[_col].astype(str).str.contains(_pat, case=False, na=False, regex=True)]
+                _hit = sorted(df[_col].astype(str).unique())
+                if len(_hit) > 1:
+                    print(f"[hap_counts] NOTE: assay={_want!r} matched {len(_hit)} distinct "
+                          f"values {_hit} -- these are being pooled.")
+            else: # donor: exact match
                 df = df[df[_col].astype(str) == str(_want)]
         if len(df) == 0:
             raise ValueError(f"hap_counts source: no rows after donor/assay filter "
@@ -1544,7 +1547,7 @@ class MultiTissuePeakRowSource(RowSource):
                 print(f"[consensus] {n_wide}/{len(out)} loci ({n_wide/len(out):.1%}) span more than "
                       f"10x merge_window_bp (max {int(span.max()):,}bp) -- summits chained through a "
                       f"dense region; one anchor now represents that whole span.")
-        return pd.DataFrame(rows)
+        return out
 
     # ---- read all tissue BigWigs over ±radius at a set of anchors ----
     def _read_signal_matrix(self, chrom, anchors, path_key="bigwig_path") -> np.ndarray:
@@ -1565,6 +1568,8 @@ class MultiTissuePeakRowSource(RowSource):
                 print(f"[signal] WARNING: {chrom!r} absent from {d['tissue']}'s {path_key} "
                       f"({p}) -- that track will be all-NaN (masked out) for this chromosome. "
                       f"BigWig has e.g. {sorted(_chroms)[:4]}.")
+                bw.close()
+                continue
 
             for i, a in enumerate(anchors):
                 s = max(0, a - r); e = min(csize, a + r + 1)
