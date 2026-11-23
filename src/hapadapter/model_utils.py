@@ -40,6 +40,7 @@ def build_prediction_head(
         raise ValueError(f"hidden_size must be positive or -1, got {hidden_size}.")
     if not (0 <= dropout < 1):
         raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
+    get_activation_module(activation)
 
     # Linear head
     if num_layers == 1:
@@ -60,12 +61,25 @@ def build_prediction_head(
 def neff_weight(depth, like, s: float):
     """
     Precision weight w_i = n_eff(n_i) = n(1+s)/(n+s)
-    ** normalised to mean 1 (LR invariant) **
+    ** normalised to mean 1 (LR invariant) over each batch**
     ** defaults to 1's when depth is None **
     """
-    import torch
     if depth is None:
         return torch.ones_like(like)
-    n = depth.float().view_as(like).clamp(min=1.0)
+    if s <= 0:
+        raise ValueError(f"neff_s must be > 0, got {s}.")
+    if depth.numel() != like.numel():
+        raise ValueError(
+            f"neff_weight: depth has {depth.numel()} elements but the tensor it must align "
+            f"with has {like.numel()} (shapes {tuple(depth.shape)} vs {tuple(like.shape)}). "
+            f"A per-locus depth cannot be broadcast onto a multi-track target without "
+            f"saying which track each depth belongs to!")
+    n = depth.float().view_as(like)
+    bad = ~torch.isfinite(n)
+    if bad.any():
+        raise ValueError(f"neff_weight: {int(bad.sum())}/{n.numel()} depths are NaN or inf.")
+    if (n < 0).any():
+        raise ValueError(f"neff_weight: {int((n < 0).sum())} depths are negative.")
+    n = n.clamp(min=1.0)
     w = n * (1.0 + s) / (n + s)
     return w / w.mean()

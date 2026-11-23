@@ -132,7 +132,12 @@ def rows_from_eval_results(exp_root, assays, donors, run_subdir, metric_key,
     out, fallback = [], []
     for assay in assays:
         for donor in donors:
-            for arm_dir, arm in (("ref", "reference"), ("personal", "personal")):
+            # SAME ARM SET AS rows_from_perlocus. The two loaders read different files
+            # for the same runs, so an arm registered in one and not the other is invisible
+            # depending only on which --from_* flag was used -- which is how the pretrained
+            # control came back as "only has ['pretrained'] -- no transition to draw".
+            for arm_dir, arm in (("ref", "reference"), ("personal", "personal"),
+                                 ("pretrained", "pretrained"), ("refit", "refit")):
                 base = os.path.join(exp_root, f"{assay.lower()}_{donor}",
                                     f"stage2_{arm_dir}", "runs", run_subdir)
                 hits = (glob.glob(os.path.join(base, "results", "*", "eval_results.json"))
@@ -483,7 +488,17 @@ def main():
                              "run directories are addressed as <root>/<assay>_<donor>/...")
         d = rows_from_perlocus(a.from_perlocus, a.build_root or a.from_perlocus,
                                assays_cli, [x.strip() for x in a.donors.split(",")],
-                               [("ref", "reference"), ("personal", "personal")],
+                               [("ref", "reference"), ("personal", "personal"),
+                                # the no-fine-tune control, written by pretrained_control.sbatch
+                                # to stage2_pretrained beside the other two. Listed here rather
+                                # than discovered by glob so an unexpected stage2_* directory
+                                # cannot quietly become an arm of a published figure.
+                                ("pretrained", "pretrained"),
+                                # the matched-trainer arm: the SAME fit_adapter fit on the
+                                # fine-tuned trunk. An arrow pretrained->refit moves only the
+                                # encoder; pretrained->personal also changes the trainer,
+                                # since the personal heads predate the port.
+                                ("refit", "refit")],
                                a.run_subdir, metric=a.perlocus_metric, n_boot=a.n_boot,
                                seed=a.seed)
         if d.empty:

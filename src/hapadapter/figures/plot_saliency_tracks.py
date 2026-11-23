@@ -81,9 +81,15 @@ def motif_density(onehot, motifs, fimo, threshold, smooth_w):
     return {tf: smooth(cover[tf] / N, smooth_w) for tf in motifs}
 
 
+def _axis_for(vidx, L, align):
+    """x coordinates for one track: bp relative to the window centre, or to its variant."""
+    return np.arange(L) - (L // 2 if align == "center" else vidx)
+
+
 def draw_saliency_tracks(ax, tracks, motifs=None, *, shared_windows=False,
                          fimo_threshold=1e-4, smooth_w=11, band="iqr", normalize=False,
-                         mode="ism", title=None, fontsize=None, legend=True):
+                         mode="ism", title=None, fontsize=None, legend=True,
+                         align="center", mark_variants=False):
     """
     Draw the saliency tracks (and optional cofactor-density overlay) onto an EXISTING axis.
 
@@ -96,12 +102,17 @@ def draw_saliency_tracks(ax, tracks, motifs=None, *, shared_windows=False,
     """
     fs = fontsize
     L = tracks[0][1].shape[1]
-    x = np.arange(L) - L // 2
+    # PER-TRACK x. With align="center" every track shares one axis and this is the old
+    # behaviour exactly. With align="variant" each track is shifted so its own variant sits
+    # at 0, which is the view that answers "does the peak travel with the variant": tracking
+    # peaks superimpose, a peak pinned to the window centre fans out by the offsets instead.
+    xs = {lab: _axis_for(vidx, L, align) for lab, _i, _o, vidx in tracks}
+    x = _axis_for(L // 2, L, "center")           # shared axis, used by shared_windows only
     tcmap = plt.get_cmap("viridis")
     single = len(tracks) == 1
 
     profs = {}
-    for lab, imp, _oh in tracks:
+    for lab, imp, _oh, _vi in tracks:
         profs[lab] = smooth(imp.mean(0), smooth_w)
     norm_by = max((p.max() or 1.0) for p in profs.values()) if normalize else 1.0
 
@@ -109,19 +120,24 @@ def draw_saliency_tracks(ax, tracks, motifs=None, *, shared_windows=False,
     # against the (many, noisy) cofactor-density curves; fall back to viridis for other labels.
     FIXED = {"AS": "#d1495b", "nonAS": "#3d6cb3", "non-AS": "#3d6cb3",
              "peak": "#d1495b", "background": "#3d6cb3"}
-    for i, (lab, imp, _oh) in enumerate(tracks):
+    for i, (lab, imp, _oh, vidx) in enumerate(tracks):
         prof = profs[lab] / norm_by
+        xt = xs[lab]
         col = FIXED.get(lab, tcmap(0.12 + 0.72 * i / max(1, len(tracks) - 1))
                         if len(tracks) > 1 else "#4b0082")
         lw = 3.4 if i == 0 else 3.0        # thick: saliency is the message, density is context
-        ax.plot(x, prof, color=col, lw=lw, label=f"{lab} saliency", zorder=10 - i,
+        ax.plot(xt, prof, color=col, lw=lw, label=f"{lab} saliency", zorder=10 - i,
                 solid_capstyle="round")
+        if mark_variants and align == "center":
+            # where this track's variant actually is. Without it the reader has to take the
+            # label's word for which offset a curve belongs to.
+            ax.axvline(vidx - L // 2, color=col, ls=":", lw=1.1, alpha=0.75, zorder=2)
         if single and band != "none":
             if band == "iqr":
                 lo, hi = np.percentile(imp, [25, 75], axis=0)
             else:
                 sd = imp.std(0); lo, hi = imp.mean(0) - sd, imp.mean(0) + sd
-            ax.fill_between(x, smooth(lo, smooth_w) / norm_by, smooth(hi, smooth_w) / norm_by,
+            ax.fill_between(xt, smooth(lo, smooth_w) / norm_by, smooth(hi, smooth_w) / norm_by,
                             color="#7030a0", alpha=0.16, lw=0)
 
     # ---- motif density overlay (SECONDARY y-axis: density is a fraction in [0,1], a different
@@ -137,10 +153,10 @@ def draw_saliency_tracks(ax, tracks, motifs=None, *, shared_windows=False,
                 ax2.plot(x, dens[nm], color=cmap(j), lw=1.0, ls="-", alpha=0.55, zorder=3,
                          label=f"{nm} density")
         else:
-            for i, (lab, _imp, oh) in enumerate(tracks):
+            for i, (lab, _imp, oh, _vi) in enumerate(tracks):
                 dens = motif_density(oh, motifs, fimo, fimo_threshold, smooth_w)
                 for j, nm in enumerate(dens):
-                    ax2.plot(x, dens[nm], color=cmap(j),
+                    ax2.plot(xs[lab], dens[nm], color=cmap(j),
                              lw=0.9, ls="--" if i else "-", alpha=0.5, zorder=3,
                              label=f"{nm} density ({lab})")
         ax2.set_ylabel("motif-hit density (fraction of windows)",
@@ -151,7 +167,8 @@ def draw_saliency_tracks(ax, tracks, motifs=None, *, shared_windows=False,
             ax2.tick_params(labelsize=fs - 1)
 
     ax.axvline(0, color="red", ls="--", lw=1, zorder=1)
-    ax.set_xlabel("position relative to center (bp)", **({} if fs is None else {"fontsize": fs}))
+    ax.set_xlabel("position relative to " + ("center" if align == "center" else "variant")
+                  + " (bp)", **({} if fs is None else {"fontsize": fs}))
     ax.set_ylabel(("normalized " if normalize else "") + "ISM saliency (Δ score / substitution)",
                   **({} if fs is None else {"fontsize": fs}))
     ax.set_title(title or "aggregate saliency vs cofactor motif density",
@@ -168,7 +185,18 @@ def draw_saliency_tracks(ax, tracks, motifs=None, *, shared_windows=False,
 
 
 def load_tracks(pairs):
-    """[(label, path), ...] -> [(label, importance, onehot), ...]; all must share one length."""
+    """
+    [(label, path), ...] -> [(label, importance, onehot, variant_index), ...].
+
+    VARIANT_INDEX IS CARRIED, NOT ASSUMED. Every window set built before the jitter work put
+    the variant at the centre, so L//2 was the variant position and nothing needed to record
+    it. A jittered build puts it at left_bp instead, and an npz from one is indistinguishable
+    from an npz from the other by its arrays alone -- which is exactly why ism_saliency now
+    writes variant_index. Falling back to L//2 keeps every pre-jitter npz working unchanged;
+    the warning is there so a jittered run that lost the column cannot pass silently.
+
+    All tracks must share one length: the figure plots them on one axis.
+    """
     tracks, L = [], None
     for lab, path in pairs:
         d = np.load(path, allow_pickle=True)
@@ -177,7 +205,20 @@ def load_tracks(pairs):
             L = imp.shape[1]
         elif imp.shape[1] != L:
             raise SystemExit(f"track {lab}: L={imp.shape[1]} != {L}")
-        tracks.append((lab, imp, onehot))
+        if "variant_index" in d:
+            vi = np.unique(np.asarray(d["variant_index"]).astype(int))
+            if len(vi) != 1:
+                raise SystemExit(f"track {lab}: windows disagree on variant_index {vi[:5]}; "
+                                 f"a track must be one offset arm.")
+            vidx = int(vi[0])
+            if not 0 <= vidx < L:
+                raise SystemExit(f"track {lab}: variant_index {vidx} outside the window (L={L}).")
+        else:
+            vidx = L // 2
+            print(f"[warn] {lab}: no variant_index in {path}; assuming the centre ({vidx}). "
+                  f"Correct for any window set built before the jitter work, WRONG for a "
+                  f"jittered one -- rebuild it if this track is part of an offset sweep.")
+        tracks.append((lab, imp, onehot, vidx))
     return tracks
 
 
@@ -197,6 +238,15 @@ def main():
     ap.add_argument("--band", choices=["iqr", "std", "none"], default="iqr",
                     help="variability band; drawn only when a SINGLE track is plotted")
     ap.add_argument("--normalize", action="store_true")
+    ap.add_argument("--align", choices=["center", "variant"], default="center",
+                    help="x origin. 'center' (default, the pre-jitter behaviour) plots bp from "
+                         "the window centre, so an offset sweep shows its peaks AT the offsets. "
+                         "'variant' shifts each track by its own variant_index, so tracking "
+                         "peaks superimpose at 0 and a centre-pinned peak fans out instead.")
+    ap.add_argument("--mark_variants", action="store_true",
+                    help="dotted vertical line at each track's variant position (--align center)")
+    ap.add_argument("--csv_out", default=None,
+                    help="per-track table: expected offset, observed peak, error, peak height")
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
@@ -222,12 +272,38 @@ def main():
     profs, _ax2 = draw_saliency_tracks(
         ax, tracks, motifs, shared_windows=a.shared_windows,
         fimo_threshold=a.fimo_threshold, smooth_w=a.smooth, band=a.band,
-        normalize=a.normalize, title=a.title)
+        normalize=a.normalize, title=a.title, align=a.align,
+        mark_variants=a.mark_variants)
     fig.tight_layout()
     fig.savefig(a.out, dpi=150, bbox_inches="tight")
-    for lab in profs:
-        p = profs[lab]
-        print(f"[track] {lab}: peak {p.max():.4f} at {int(np.argmax(p))-L//2:+d} bp")
+
+    # THE TWO NUMBERS, not an eyeball of the figure.
+    #   error  = observed peak - expected peak, in bp. Near 0 across an offset sweep is the
+    #            result; an error that equals MINUS the expected offset means the peak never
+    #            moved off the window centre, which is the artifact the control rules out.
+    #   height = peak saliency. Read as a TREND across offsets: a dip confined to the extreme
+    #            arms points at the window edge truncating context, not at weaker signal,
+    #            and that distinction is not visible in the error column.
+    rows = []
+    print(f"\n  {'track':<14}{'expected':>10}{'observed':>10}{'error':>8}{'peak':>10}")
+    for lab, _imp, _oh, vidx in tracks:
+        prof = profs[lab]
+        obs = int(np.argmax(prof)) - L // 2        # always reported centre-relative
+        exp = vidx - L // 2
+        rows.append(dict(track=lab, window_len=L, variant_index=vidx,
+                         expected_bp=exp, observed_bp=obs, error_bp=obs - exp,
+                         peak=float(prof.max())))
+        print(f"  {lab:<14}{exp:>+10d}{obs:>+10d}{obs-exp:>+8d}{prof.max():>10.4f}")
+    if len(rows) > 1:
+        err = np.array([r["error_bp"] for r in rows])
+        pk = np.array([r["peak"] for r in rows])
+        print(f"\n  |error| median {np.median(np.abs(err)):.0f} bp, max {np.abs(err).max():.0f} bp"
+              f"  |  peak range {pk.min():.4f}-{pk.max():.4f} "
+              f"({'flat' if pk.max() <= 1.5 * pk.min() else 'VARIES >1.5x across arms'})")
+    if a.csv_out:
+        import pandas as pd
+        pd.DataFrame(rows).to_csv(a.csv_out, index=False)
+        print(f"[out] {a.csv_out}")
     print(f"[out] {a.out}")
 
 
