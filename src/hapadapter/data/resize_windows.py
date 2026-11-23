@@ -11,12 +11,12 @@ Indel content measured:
 
 Usage:
   python -m hapadapter.data.resize_windows \\
-    --src_csv      experiments/ctcf_ENC-002/stage2_personal_data/test.csv \\
-    --src_meta_csv experiments/ctcf_ENC-002/stage2_personal_data/test.meta.csv \\
-    --hap1_fasta .../enc002.hap1.fa --hap1_chain .../enc002.hap1.chain \\
-    --hap2_fasta .../enc002.hap2.fa --hap2_chain .../enc002.hap2.chain \\
+    --src_csv      .../test.csv \\
+    --src_meta_csv .../test.meta.csv \\
+    --hap1_fasta .../hap1.fa --hap1_chain .../hap1.chain \\
+    --hap2_fasta .../hap2.fa --hap2_chain .../hap2.chain \\
     --left 8192 --right 8191 --backbone alphagenome \\
-    --n_neg_per_pos 1 --match_depth --split test --out_dir windows/ctcf_long
+    --n_neg_per_pos 1 --match_depth --split test --out_dir windows/{assay}_long
 """
 import argparse
 import os
@@ -46,7 +46,7 @@ LENGTH_CHECKS = {
     "alphagenome": _check_alphagenome,
     "none": _check_none,
 }
-_OVERLAP_LOSER = "dev" # keep sequence in train split if longer sequences led to train/dev leakage
+_OVERLAP_LOSER = "dev" # keep sequence in train split if longer sequences led to cross-split train/dev leakage
 
 def cross_split_overlap(this_split, chrom, pos, src_dir, left, right, chrom_col, pos_col):
     """
@@ -112,7 +112,7 @@ def neg_ratio(v):
 def select_loci(df, n_neg_per_pos, match_depth, cov_col, seed):
     """
     All positives, plus negatives drawn 1:n
-    With --match_depth the negatives come from within the positives' depth deciles
+    With --match_depth the negatives come from within the positives' read-depth deciles
     """
     pos = df.index[df["label"] == 1].to_numpy()
     neg = df.index[df["label"] == 0].to_numpy()
@@ -172,19 +172,22 @@ def main():
                     help="which foundation model will serve as the backbone for the HapAdapter head")
     ap.add_argument("--n_neg_per_pos", type=neg_ratio, default=1.0, metavar="N|none",
                     help="negatives per positive (1:1 balanced default). Pass 'none' "
-                         "to TRAIN a head on these windows")
+                         "to keep all the windows.")
     ap.add_argument("--match_depth", action="store_true",
                     help="draw negatives from within the positives' depth deciles")
-    ap.add_argument("--cov_col", default="depth")
+    ap.add_argument("--cov_col", default="depth",
+                    help="depth/coverage column to carry through, and to match negatives on "
+                         "with --match_depth if selected.")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--limit", type=int, default=0, help="PILOT: first N selected loci")
+    ap.add_argument("--limit", type=int, default=0, help="for a pilot run on first N selected loci")
     ap.add_argument("--split", default="test", choices=["train", "dev", "test"],
-                    help="names the output files. Must match what --src_csv actually is")
+                    help="names the output files. Must match what --src_csv actually is.")
     ap.add_argument("--drop_cross_split_overlap", action="store_true",
                     help="drop loci whose resized window overlaps a locus across train/dev. "
                          f"In those cases, only the {_OVERLAP_LOSER!r} side is dropped.")
     ap.add_argument("--out_dir", required=True)
     a = ap.parse_args()
+    
     if a.n_neg_per_pos is None and a.match_depth:
         raise SystemExit(
             "--match_depth with --n_neg_per_pos none asks for two incompatible things: "
@@ -225,16 +228,24 @@ def main():
     if ov_detail:
         print(f"[overlap] at {L} bp, {n_ov} of {len(src)} {a.split} loci ({n_ov/len(src):.1%}) "
               f"have a window overlapping another split: {ov_detail}")
-    if n_ov and a.split == _OVERLAP_LOSER and a.drop_cross_split_overlap:
-        src = src.loc[~ov_mask].reset_index(drop=True)
-        print(f"[overlap] dropped -> {len(src)} loci remain")
-    elif n_ov and a.split == _OVERLAP_LOSER:
-        print(f"[overlap] NOT dropped. Pass --drop_cross_split_overlap to remove them; a head "
-              f"selected on this dev set has otherwise seen train sequence.")
-    elif n_ov:
-        print(f"[overlap] nothing dropped here by design -- the {_OVERLAP_LOSER!r} side is the "
-              f"one that loses loci. Run --split {_OVERLAP_LOSER} "
-              f"--drop_cross_split_overlap to close it.")
+    if n_ov:
+        hit = sorted(k for k, v in ov_detail.items() if v)
+        if a.drop_cross_split_overlap:
+            src = src.loc[~ov_mask].reset_index(drop=True)
+            print(f"[overlap] dropped {n_ov} {a.split} loci overlapping {hit} "
+                  f"-> {len(src)} remain")
+        else:
+            sev = {"test": "TEST-SET LEAKAGE", "dev": "SELECTION LEAKAGE"}.get(a.split, "TRAIN CONTAMINATION")
+            print(f"[overlap] NOT dropped -- {sev}: {n_ov} {a.split} loci share window span with {hit}.")
+            print(f"[overlap] --drop_cross_split_overlap removes them FROM {a.split!r}. "
+                  f"Dropping on the {_OVERLAP_LOSER!r} side instead is our "
+                  f"convention, and closes the pair only when {_OVERLAP_LOSER!r} is one of "
+                  f"{hit} -- re-run that split with the flag if so.")
+
+    if a.match_depth and a.cov_col not in src.columns:
+        raise SystemExit(
+            f"--match_depth needs the {a.cov_col!r} column, and the source split does not have "
+            f"it. Columns present: {sorted(src.columns)}.")
 
     src = select_loci(src, a.n_neg_per_pos, a.match_depth, a.cov_col, a.seed)
     if a.limit:
@@ -258,15 +269,11 @@ def main():
             return None
         return (hi[1] - lo[1]) - (a.left + a.right)
 
-    rows, fails = [], {}
+    rows = []
     for i, r in enumerate(src.itertuples()):
         ch, p0 = str(getattr(r, chrom_col)), int(getattr(r, pos_col))
-        res, why = pg.pair_windows(ch, p0, r.hap1_allele, r.hap2_allele,
-                                   left=a.left, right=a.right)
-        if res is None:
-            k = str(why).split("(")[0].strip()
-            fails[k] = fails.get(k, 0) + 1
-        else:
+        res, _why = pg.pair_windows(ch, p0, r.hap1_allele, r.hap2_allele, left=a.left, right=a.right)
+        if res is not None:
             d1, d2 = net_indel(c1, ch, p0), net_indel(c2, ch, p0)
             rec = dict(sequence1=res["seq1"], sequence2=res["seq2"], label=int(r.label))
             if a.cov_col in src.columns:
@@ -291,14 +298,18 @@ def main():
     out["indel_bp_ref"] = ref_dep
     out["het_indel_bp"] = np.abs(pair[:, 0] - pair[:, 1])
 
-    print(f"\n[extract] kept {len(out)} of {len(src)} | allele match rate {pg.match_rate():.3f}")
-    if fails:
-        print(f"[extract] failures by reason: {fails}")
+    print(f"\n[extract] kept {len(out)} of {len(src)} | allele match rate "
+          f"{pg.match_rate(attempted_only=True):.3f} (over loci actually lifted)")
+
+    drops = {k: v for k, v in pg.stats.items() if k not in ("total", "ok", "swap") and v}
+    if drops:
+        print(f"[extract] drops by category: {drops}")
         lost = len(src) - len(out)
         if lost > 0.05 * len(src):
             print(f"[extract] WARNING {lost/len(src):.1%} of loci dropped. At {L} bp this is "
                   f"large enough that the survivors may not represent the source split -- "
                   f"check the reasons above before comparing this arm to a short-window one.")
+
     short = int((out["sequence1"].str.len() != L).sum() + (out["sequence2"].str.len() != L).sum())
     if short:
         sys.exit(f"{short} sequences are not {L} bp -- extract_window returned a short window")
