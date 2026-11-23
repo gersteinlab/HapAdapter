@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 """
 hapadapter.personal_seq
 
@@ -9,7 +8,7 @@ Two vcf2diploid liftOver chains per individual map the reference to each haploty
     ENC00X_maternal.chain   REF -> maternal    (hap1)
     ENC00X_paternal.chain   REF -> paternal    (hap2)
 
-For a het SNV at REF (chrom, pos0) [0-based] with alleles a1 (hap1_allele), a2 (hap2_allele):
+For a hetSNV at REF (chrom, pos0) [0-based] with alleles a1 (hap1_allele), a2 (hap2_allele):
 
   1. Lift pos0 through each chain -> maternal coord / paternal coord (None if deleted there)
 
@@ -28,8 +27,6 @@ UCSC chain format (0-based, half-open; target = REF, query = haplotype):
 vcf2diploid emits +/+ strands (asserted in this file to be safe)
 
 NOTE: lift is only valid if the hetSNV calls and vcf2diploid used the SAME reference windows (hg38)
-
-File written by Amy Metrick in collaboration with Anthropic's Claude Science Opus 5 Agent
 """
 
 import bisect
@@ -91,7 +88,6 @@ class _Chain:
             return self._qstarts[i] + (tpos - self._tstarts[i])
         return None
 
-
 def parse_chain_file(path):
     """Parse a (possibly multi-chromosome) UCSC chain file -> {target_chrom: [_Chain, ...]}"""
     index = defaultdict(list)
@@ -130,7 +126,7 @@ def lift_point(chain_index, chrom, pos0):
     Lift 0-based (chrom, pos0) through the first covering chain -> (q_name, q_pos0) or None
 
     NOTE: if several chains cover `pos0`, the FIRST in file order wins;
-    vcf2diploid emits one chain per chromosome so this does not arise in the entexBERT-2 implementation,
+    vcf2diploid emits one chain per chromosome so this is not an issue for the published HapAdapter models,
     but note that UCSC liftOver files would need to be score-sorted for this to pick the best alignment
     """
     for ch in chain_index.get(chrom, ()):
@@ -183,9 +179,9 @@ def extract_window(fasta, chrom, q_pos0, left, right):
 # ---------------------------------------------------------------------------------------------
 class PersonalGenome:
     """
-    hap1 = (maternal chain, hap1 FASTA), hap2 = (paternal chain, hap2 FASTA) per the README default.
-    pair_windows() lifts a REF het SNV into both haplotypes, extracts variant-centered windows, and
-    assigns them to hap1/hap2 by ALLELE-MATCH (so a sex-chrom mat/pat swap is auto-corrected).
+    hap1 = (maternal chain, hap1 FASTA), hap2 = (paternal chain, hap2 FASTA)
+    pair_windows() lifts a REF hetSNV into both haplotypes, extracts variant-centered windows, and
+    assigns them to hap1/hap2 by ALLELE-MATCH (so a sex-chrom mat/pat swap is auto-corrected)
     """
     def __init__(self, hap1_chain_index, hap1_fasta, hap2_chain_index, hap2_fasta, donor=None,
                 validate=True):
@@ -198,11 +194,6 @@ class PersonalGenome:
             self._validate_chain_fasta()
 
     def _validate_chain_fasta(self):
-        """Fail fast when a chain was built against a DIFFERENT FASTA than the one supplied: for
-        every chain whose query contig resolves, the chain's qSize must equal that contig's length.
-        Otherwise the mismatch surfaces only as a mysteriously low allele-match rate after a full
-        run. Silently skipped if the FASTA object does not support len() (this class is otherwise
-        FASTA-agnostic: it only needs fa[chrom][a:b])."""
         who = f"donor {self.donor}: " if self.donor else ""
         for tag, chain_index, fasta in (("hap1", self.h1_chain, self.h1_fa),
                                         ("hap2", self.h2_chain, self.h2_fa)):
@@ -257,11 +248,15 @@ class PersonalGenome:
             self.stats["not_het"] += 1
             return None, f"alleles are identical ({a1}) -- not a heterozygous SNV"
 
+        bad = [x for x in (a1, a2) if len(x) != 1 or x not in "ACGT"]
+        if bad:
+            self.stats["non_acgt_allele"] += 1
+            return None, (f"allele(s) {bad} are not a single A/C/G/T base -- indels and "
+                          f"ambiguity codes cannot be matched against a personal base")
+
         # lift through BOTH chains (maternal / paternal), extract a variant-centered window from each
         def side(chain_index, fasta, tag):
-            """-> (window, None) or (None, reason). Reasons are distinct so the stats tell a
-            CONFIG error (contig unresolved -> every locus on that chrom fails) apart from
-            biology (variant deleted in this haplotype) and geometry (window off contig end)."""
+            """-> (window, None) or (None, reason)"""
             lifted = lift_point(chain_index, chrom, pos0)
             if lifted is None:
                 return None, f"{tag}_deleted" # target gap, or no covering chain
@@ -284,6 +279,12 @@ class PersonalGenome:
         (m_seq, off), (p_seq, _) = m, p
         m_base, p_base = m_seq[off], p_seq[off]
 
+        if m_base not in "ACGT" or p_base not in "ACGT":
+            self.stats["personal_base_not_acgt"] += 1
+            return None, (f"personal base is not A/C/G/T at {chrom}:{pos0} "
+                          f"(maternal {m_base!r}, paternal {p_base!r}) -- uncalled or masked "
+                          f"in this haplotype genome, not a disagreement with the call")
+
         # assign by allele-match; auto-correct a maternal/paternal <-> hap1/hap2 swap (sex chroms)
         if m_base == a1 and p_base == a2:
             self.stats["ok"] += 1
@@ -296,6 +297,8 @@ class PersonalGenome:
         return None, (f"personal allele mismatch at {chrom}:{pos0} "
                       f"(maternal base {m_base!r}, paternal base {p_base!r}; expected {{{a1},{a2}}})")
 
-    def match_rate(self):
+    def match_rate(self, attempted_only=False):
         t = self.stats["total"]
+        if attempted_only:
+            t -= self.stats["not_het"] + self.stats["non_acgt_allele"]
         return (self.stats["ok"] / t) if t else float("nan")
