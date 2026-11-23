@@ -1,206 +1,19 @@
 #!/usr/bin/env python3
-
 """
-hapadapter.build_experiment -- config-driven entexBERT-2 dataset runner (2-stage ASB pipeline)
+hapadapter.build_experiment -- config-driven dataset generator
 
 Each experiment is a declarative config (YAML or JSON); this runner composes a row source
-with a primary label and calls the source-agnostic build_dataset in hapadapter.build_inputs.
+with a primary label and calls the source-agnostic build_dataset in hapadapter.build_inputs
 
 New formats are added by:
     1. implementing a RowSource / make_*_label_spec in build_inputs
     2. registering it in ROW_SOURCE_BUILDERS / LABEL_BUILDERS below. 
-
-New *experiments* need no new code!
-
-For 2-stage entexBERT-2 on ASB classification:
-
-  Stage 1 (binding trunk):      row_source multi_tissue_peak + label bigwig / multitrack
-  Stage 2 (ASB contrast head):  row_source hap_counts + label as_class, with
-                                depth_col: n  (n carried through as the privileged weight)
-
-Usage examples:
-    python build_experiment.py configs/stage2_ctcf_asb.yaml
-    python build_experiment.py exp.yaml --ref_fasta /data/hg38.fa --output_dir runs/run_name
-
-File written by Amy Metrick in collaboration with Anthropic's Claude Science Opus 5 Agent
-
-** Config formating details: **
-
-===========================================================================
-TOP LEVEL                                        (* = required)
-===========================================================================
-    ref_fasta *       path to the reference FASTA (CLI --ref_fasta overrides)
-    output_dir *      where train/dev/test CSVs + .meta.csv sidecars are written
-    row_source *      see ROW SOURCES
-    primary_label *   see LABELS
-    experiment        name recorded in finetune_settings.json          [experiment]
-    window            see WINDOW                                       [{}]
-    sequence          see SEQUENCE                                     [{}]
-    split             see SPLIT                                        [{}]
-    balance           see BALANCE                                      [{}]
-    partition         see PARTITION (omit -> group-shuffle split)      [None]
-    head              see HEAD (architecture only; task is derived)    [None]
-    depth_col         source column carried as the `depth` weight      [None]
-                      Stage 2 uses `n` (total reads -> n_eff weight)
-    count_cols        extra columns copied into the Trainer CSVs       [None]
-                      (multi-track Stage 1 uses this for y_track_*/m_track_*)
-
-===========================================================================
-ROW SOURCES   row_source: {type: ..., ...}
-===========================================================================
-  type: hap_counts          Stage 2. One row per (donor, locus) from build_hap_counts.py.
-    path *                  CSV path; needs chr, ref_start, ref_allele,
-                            hap1_allele, hap2_allele, k, n
-    assay                   recorded on every row                      [None]
-    donor                   recorded on every row                      [None]
-
-  type: multi_tissue_peak   Stage 1. One row per consensus peak locus + sampled background.
-    tissue_tracks *         [{tissue, peak_path, bigwig_path, [pval_path], [group]}, ...]
-                            `group` = TF name; when EVERY entry has one, tracks are grouped
-                            by TF instead of one track per tissue
-    assay *                 recorded on every row
-    donor *                 recorded on every row
-    genome_sizes            chrom-sizes TSV; REQUIRED when background_ratio > 0 [None]
-    format                  'narrowpeak' | 'bed3'                      [narrowpeak]
-                            bed3 has no signalValue -> the summit tiebreak and the
-                            mean_depth proxy become constant
-    summit_mode             'summit' | 'midpoint'                      [summit]
-    merge_window_bp         summits within this distance join one locus (single-linkage,
-                            so dense regions can chain -- a diagnostic reports it)  [100]
-    label_radius_bp         half-width of the signal read at each locus [32]
-    background_ratio        background loci sampled per consensus locus [1.0]
-    background_gap_bp       minimum distance from any peak             [1000]
-    exclude_chroms          chromosomes dropped before everything      [None]
-    seed                    background sampling seed                   [42]
-
-===========================================================================
-LABELS   primary_label: {type: ..., ...}        task_type drives the head
-===========================================================================
-  type: as_class            Stage 2 ASB target, binary 0/1     (classification)
-    column                                                     [imbalance_significance]
-    name                    output column name (alias: target_name) [as_class]
-
-  type: bigwig              Stage 1 binding signal             (regression)
-    path *                  BigWig file
-    signal_mode             mean|max|min|sum|std|coverage|mean_nonzero|max_abs   [max]
-    region                  'window' | 'snv' | 'snv_radius'    [snv_radius]
-    radius_bp               used when region=snv_radius        [20]
-    missing_value           returned when the region has no finite signal AND when
-                            the row's chromosome is ABSENT from the BigWig. 0.0 is a
-                            valid-looking label that the NaN filter will not drop;
-                            pass .nan to have such rows dropped instead      [0.0]
-    use_values              read per-base values and summarize here (safest, predictable
-                            NaN handling) vs bw.stats zoom levels                [True]
-    exact                   when use_values=False, pass exact= to bw.stats       [True]
-    name / transform        see COMMON
-    
-
-  type: column              precomputed source column          (regression)
-    column *                column to read
-    name                    output column name                 [= column]
-    transform               see COMMON
-
-  type: multitrack          Stage 1, one target per track      (regression)
-    num_tracks *            number of y_track_*/m_track_* columns
-    anchor_column           scalar column kept alongside       [binding_label_raw]
-    name                                                       [binding_label_raw]
-
-  COMMON (all label types)
-    name                    output column name
-    transform               'identity' | 'log1p'
-                            defaults: bigwig/multitrack -> log1p, column/as_class -> identity
-
-===========================================================================
-WINDOW   window: {...}
-===========================================================================
-    left_bp *               bases left of the anchor
-    right_bp *              bases right of the anchor (window = left+right+1)
-    offset_mode             'fixed' | 'uniform'                        [fixed]
-    jitter_max_bp           max anchor jitter when offset_mode=uniform [0]
-    chrom_sizes             chrom-sizes TSV. Without it windows cannot be bounds-checked
-                            and an off-contig window aborts the build at the length check
-                            instead of being dropped with a count              [None]
-
-===========================================================================
-SEQUENCE   sequence: {...}
-===========================================================================
-    input_mode              hap_pair | ref_single | ref_alt_pair |
-                            ref_hap1_pair | ref_hap2_pair | hap1_single | hap2_single [hap_pair]
-    mode                    'reference' (hg38 + allele swap) | 'personal'   [reference]
-    hap_fastas              personal only: {ENC-00X: [hap1.fa, hap2.fa]}    [None]
-    chains                  personal only: {ENC-00X: [maternal.chain, paternal.chain]} [None]
-                            hap1 <- maternal, hap2 <- paternal; PersonalGenome re-derives
-                            the assignment per locus by allele match
-
-===========================================================================
-SPLIT   split: {...}        (ignored when partition.enabled -- see PARTITION)
-===========================================================================
-    mode                    'train_dev_test' | 'train_only'            [train_dev_test]
-    ratio                   (train, dev, test)                         [(0.8, 0.1, 0.1)]
-    seed                    split + jitter seed                        [42]
-    group                   'locus' -> group by locus_id (leakage prevention); '' disables
-                            grouping AND the duplicate/label-conflict summary      [locus]
-    skip_ambiguous          drop sequences containing N                [True]
-    dedup_across_splits     drop a sequence already present in an earlier split    [True]
-    exclude_loci_meta       .meta.csv whose locus_id values are removed before writing [None]
-
-===========================================================================
-BALANCE   balance: {...}
-===========================================================================
-    strategy                'none' | 'global_binary' | 'per_tissue_binary'    [none]
-    label_col               column balanced on                   [imbalance_significance]
-                            rows whose value is neither 0 nor 1 are excluded (reported)
-    apply_to                'all'   -> balance BEFORE windowing/labelling/sequence
-                                       extraction; later row drops can skew the realized
-                                       ratio (reported when it drifts)
-                            'train' -> balance the train split only, after every drop
-                                       (use this when the ratio must hold)          [all]
-
-===========================================================================
-PARTITION   partition: {...}   deterministic, donor-invariant split; takes priority
-                               over `split`. Omit (or enabled: false) to fall back.
-===========================================================================
-    enabled                 turn the partition on                      [False]
-    fold_assignment         {chrom: fold index}; the chromosomes whose fold == fold_id
-                            become TEST                                [{}]
-    fold_id                 which fold is held out                     [0]
-    bin_size                hashed genomic bin size for train/dev      [100000]
-    salt                    hash salt. CHANGING IT REASSIGNS EVERY LOCUS and silently
-                            breaks comparability with prior runs       [entexbert2_v1]
-    train_frac_within_nontest   train:dev split of the non-test bins    [8/9]
-    bin_test_frac           extra TEST fraction drawn from bins. With no fold_assignment
-                            AND this at 0.0 there would be no test set (raises)     [0.0]
-    bin_dev_frac            extra DEV fraction drawn from bins         [0.0]
-    exclude_boundary        drop loci whose window straddles a bin edge (leakage
-                            control; a no-op if boundary_bp <= 0, which now raises) [False]
-    boundary_bp             half-width excluded at each bin edge
-                            [max(left_bp, right_bp) + jitter_max_bp]
-
-===========================================================================
-HEAD   head: {...}          architecture only -- `task` is DERIVED from the label
-===========================================================================
-    task                    optional; if given it must MATCH the label's task_type,
-                            else it raises. regression -> Stage-1 trunk;
-                            classification -> Stage-2 contrast head
-    head_num_layers         1 = linear head; >= 2 = MLP                [1]
-    head_hidden_size        MLP width; -1 = same as hidden size        [-1]
-    proj_dim                classification only: projection dim for the
-                            contrast distance s = ||P(h1) - P(h2)||    [128]
-    num_labels              DERIVED -- forced to 1, or to num_tracks for multitrack.
-                            A conflicting value is overridden with a note.
-
-    NOTE: any other key here is passed through to experiment_config.json for provenance
-    but does NOT reach the model. The trainer flags set the architecture; this runner
-    prints the mapping (see emit_finetune_settings). In particular head_activation is a
-    finetune_entexbert2.py flag, and it is REQUIRED for head_num_layers >= 2 -- model_io
-    raises when a checkpoint's run_config.json lacks it.
 """
 
 import argparse
 import dataclasses
 import json
 import os
-import sys
 
 from pyfaidx import Fasta
 
@@ -268,8 +81,8 @@ def _build_hap_counts_source(cfg):
     )
 
 ROW_SOURCE_BUILDERS = {
-    "multi_tissue_peak": _build_multi_tissue_peak_source,   # Stage 1 (binding trunk)
-    "hap_counts": _build_hap_counts_source,                 # Stage 2 (ASB contrast head)
+    "multi_tissue_peak": _build_multi_tissue_peak_source,   # e.g. for fine-tuning on binding
+    "hap_counts": _build_hap_counts_source,                 # e.g. for ASB HapAdapter head
 }
 
 # ---------------------------------------------------------------------------
@@ -338,10 +151,10 @@ def _build_multitrack(cfg, tf):
     return spec
 
 LABEL_BUILDERS = {
-    "bigwig": _build_bigwig,               # Stage 1 binding signal
+    "bigwig": _build_bigwig,               # binding signal
     "column": _build_column,               # precomputed source column (regression)
-    "as_class": _build_as_class,           # Stage 2 ASB target (classification, contrast head)
-    "multitrack": _build_multitrack,       # Stage 1 multi-track binding (one target per tissue)
+    "as_class": _build_as_class,           # ASB target (classification, contrast head)
+    "multitrack": _build_multitrack,       # multi-track binding (one target per tissue)
 }
 
 def build_label(cfg):
@@ -406,7 +219,9 @@ def warn_unknown_keys(cfg):
         unknown = sorted(set(block) - known)
         if unknown:
             where = "top level" if section is None else f"{section}:"
-            print(f"[config] WARNING: unknown key(s) at {where} {unknown} -- ignored. "
+            fate = ("recorded in experiment_config.json under head_resolved but NOT read by "
+                    "this runner" if section == "head" else "ignored")
+            print(f"[config] WARNING: unknown key(s) at {where} {unknown} -- {fate}. "
                   f"Known: {sorted(known)}")
 
 def load_exclude_loci(meta_paths):
@@ -458,7 +273,9 @@ def build_partition_spec(cfg):
 
 def resolve_head(head, primary_label):
     """
-    Derive/validate the finetune head config from the primary label's task_type
+    Derive and validate the two head fields the label determines:
+    1. `task` (from the label's task_type)
+    2. `num_labels` (1, or the track count for a multitrack target)
     """
     head = dict(head or {})
     task = primary_label.task_type  # comes from the label
@@ -481,7 +298,7 @@ def resolve_head(head, primary_label):
             print(f"  note: classification forces num_labels=1 (config had {head.get('num_labels')}).")
         head["num_labels"] = 1
     elif n_tracks is not None:
-        # multi-track Stage-1 binding: T outputs, one per tissue
+        # multi-track regression: T outputs, one per tissue
         head["num_labels"] = int(n_tracks)
         head["multitrack"] = True
     else:
@@ -489,41 +306,14 @@ def resolve_head(head, primary_label):
             print(f"  note: single-track regression forces num_labels=1 (config had {head.get('num_labels')}).")
         head["num_labels"] = 1
 
-    head.setdefault("head_num_layers", 1)
-    head.setdefault("head_hidden_size", -1)
-    if task == "classification":
-        # projection dim d for the shared P: hidden -> d used to form the contrast distance
-        head.setdefault("proj_dim", 128)
     return head
-
-def emit_finetune_settings(head, output_dir, primary_name, depth_col):
-    """Print the finetune settings recorded for this dataset (verified flags only)"""
-    print("\nFinetune settings (map to finetune_entexbert2.py):")
-    print(f"  --task {head['task']}")
-    print(f"  --head_num_layers {head['head_num_layers']}  (1 = linear, >1 = MLP)")
-    if head["head_num_layers"] >= 2:
-        print(f"  --head_activation gelu|relu|tanh|silu   (REQUIRED for an MLP head; "
-              f"model_io raises if run_config.json lacks it)")
-    if head.get("num_labels", 1) > 1:
-        print(f"  --num_labels {head['num_labels']}   (REQUIRED for the multi-track trunk: the "
-              f"trainer defaults to 1, which would build a scalar head against "
-              f"{head['num_labels']}-track targets and pin the scalar label_names path)")
-    if head["head_hidden_size"] != -1:
-        print(f"  --head_hidden_size {head['head_hidden_size']}")
-    if head["task"] == "classification":
-        print(f"  --proj_dim {head.get('proj_dim', 128)}   (shared projection dim d for the contrast distance)")
-        print(f"  --balanced_sampler True   (class-balanced batches)")
-    if depth_col:
-        print(f"  --neff_s <s>   (privileged precision weight from '{depth_col}' -> depth)")
-    print(f"  trainer data path: {output_dir}")
-    print(f"  primary label column: {primary_name}")
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Run an entexBERT-2 dataset generation experiment from a config")
+    p = argparse.ArgumentParser(description="Run a HapAdapter dataset generation experiment from a config")
     p.add_argument("config", help="Path to the experiment config (.yaml/.yml/.json)")
     p.add_argument("--ref_fasta", default=None, help="Override ref_fasta from the config")
     p.add_argument("--output_dir", default=None, help="Override output_dir from the config")
@@ -536,7 +326,7 @@ def build_personal_genomes(seqcfg):
         hap_fastas: {ENC-00X: [hap1.fa, hap2.fa]} 
         chains:     {ENC-00X: [maternal.chain, paternal.chain]}
 
-    For entex personal genomes v2:
+    For entex personal genomes:
     hap1 -> maternal chain
     hap2 -> paternal chain
     PersonalGenome re-derives the hap1<->hap2 assignment for sex-chromosomes per locus by allele-match (to handle edge cases)
@@ -583,6 +373,15 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
     """
     name = cfg.get("experiment", "experiment")
     warn_unknown_keys(cfg)
+
+    _ovr = {"ref_fasta": ref_fasta, "output_dir": output_dir}
+    _missing = [k for k in ("ref_fasta", "output_dir", "row_source", "primary_label")
+                if not _ovr.get(k) and k not in cfg]
+    if _missing:
+        _hint = "".join(f" (or pass --{k})" for k in _missing if k in _ovr)
+        raise ValueError(f"config is missing required top-level key(s) {_missing}{_hint}. "
+                         f"Present: {sorted(cfg)}.")
+
     ref_fasta_path = ref_fasta or cfg["ref_fasta"]
     output_dir = output_dir or cfg["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
@@ -592,6 +391,12 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
 
     # window config
     wcfg = cfg.get("window", {})
+    _missing_w = [k for k in ("left_bp", "right_bp") if k not in (wcfg or {})]
+    if _missing_w:
+        raise ValueError(
+            f"window.{' and window.'.join(_missing_w)} {'is' if len(_missing_w) == 1 else 'are'} "
+            f"required; the window is left_bp + 1 + right_bp bases around the anchor and there "
+            f"is no reasonable default here for that case. Got window: {wcfg!r}.")
     window_spec = WindowSpec(
         left_bp=wcfg["left_bp"],
         right_bp=wcfg["right_bp"],
@@ -613,6 +418,13 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
     group_cols = ["locus_id"] if _group == "locus" else []
 
     split_ratio = tuple(scfg.get("ratio", (0.8, 0.1, 0.1)))
+
+    if split_mode == "train_dev_test":
+        if len(split_ratio) != 3 or abs(sum(split_ratio) - 1.0) > 1e-6:
+            raise ValueError(
+                f"split.ratio must be three numbers summing to 1.0 (train, dev, test); got "
+                f"{split_ratio} summing to {sum(split_ratio):g}.")
+
     skip_ambiguous = scfg.get("skip_ambiguous", True)
     exclude_loci = load_exclude_loci(scfg.get("exclude_loci_meta")) or None
     dedup_across_splits = scfg.get("dedup_across_splits", True)
@@ -630,10 +442,10 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
 
     input_mode = cfg.get("sequence", {}).get("input_mode", "hap_pair")
     sequence_mode = cfg.get("sequence", {}).get("mode", "reference")   # "reference" (hg38+swap) | "personal"
-    depth_col = cfg.get("depth_col")   # Stage 2: privileged precision weight (w = n_eff)
+    depth_col = cfg.get("depth_col")   # privileged precision weight (w = n_eff)
     count_cols = list(cfg.get("count_cols") or [])  # optional: extra columns carried into train.csv
 
-    # Multi-track Stage-1: carry the per-tissue target + mask columns into train.csv via the count_cols passthrough
+    # Multi-track: carry the per-tissue target + mask columns into train.csv via the count_cols passthrough
     _mt_y = getattr(primary_label, "multitrack_y_cols", None)
     if _mt_y:
         _mt_m = getattr(primary_label, "multitrack_m_cols", [])
@@ -736,7 +548,6 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
     )
 
     print(f"\nDone building! Final rows: {len(df)}")
-    emit_finetune_settings(head, output_dir, primary_label.name, depth_col)
     return df
 
 def main():
