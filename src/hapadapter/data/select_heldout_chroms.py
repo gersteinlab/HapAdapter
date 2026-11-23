@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-hapadapter.select_heldout_chroms.py — deterministic, TF-agnostic held-out test chromosome selection
+hapadapter.data.select_heldout_chroms.py — deterministic, assay-agnostic held-out test chromosome selection
 
 Pure function of a per-chromosome positive-count table plus four documented, genome-level policy parameters
-Re-run on any TF's variant set to regenerate its held-out test set
+Re-run on any assay's variant set to regenerate its held-out test set
 
 Usage:
   python select_heldout_chroms.py \
@@ -46,12 +46,19 @@ def main():
     a = ap.parse_args()
 
     df = pd.read_csv(a.eval_csv, usecols=lambda c: c in ("chr", a.label_col))
-    if a.label_col not in df.columns:
-        sys.exit(f"ERROR: label column {a.label_col!r} not found in {a.eval_csv}")
+    _missing = [c for c in ("chr", a.label_col) if c not in df.columns]
+    if _missing:
+        sys.exit(f"ERROR: {a.eval_csv} is missing column(s) {_missing}. "
+                 f"Read: {list(df.columns)}. (--label_col is currently {a.label_col!r}.)")
 
-    if "chr" not in df.columns:
-        sys.exit(f"ERROR: column 'chr' not found in {a.eval_csv} "
-                 f"(columns read: {list(df.columns)})")
+    _raw = pd.to_numeric(df[a.label_col], errors="coerce")
+    _nan = int(_raw.isna().sum())
+    _vals = set(pd.unique(_raw.dropna()).tolist())
+    if _nan or not _vals <= {0, 1}:
+        sys.exit(f"ERROR: --label_col {a.label_col!r} must be a 0/1 column; found "
+                 f"{len(_vals)} distinct value(s) e.g. {sorted(_vals)[:6]}"
+                 + (f" plus {_nan} non-numeric/missing" if _nan else "")
+                 + f" in {a.eval_csv}.")
 
     df["_lab"] = df[a.label_col].astype(int)
     g = (df.groupby("chr")["_lab"].agg(n="size", pos="sum").reset_index())
@@ -118,6 +125,12 @@ def main():
         "spared_largest": sorted(spare_big, key=natural_key),
         "special_excluded": sorted(set(a.special), key=natural_key),
         "label_col": a.label_col, "eval_csv": a.eval_csv,
+    }
+
+    meta["partition_config_block"] = {
+        "enabled": True,
+        "fold_assignment": {c: 0 for c in chosen},
+        "fold_id": 0,
     }
 
     with open(f"{a.out_prefix}_heldout.json", "w") as fh:
