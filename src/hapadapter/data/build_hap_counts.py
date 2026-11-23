@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-hapadapter.build_hap_counts
+hapadapter.data.build_hap_counts
 
 Use: aggregate EN-TEx hetSNV read counts per (donor, locus) via tissue pooling
-into a per-locus haplotype-count table for the Stage-2 ASB head
+into a per-locus haplotype-count table for training the HapAdapter AS head
 
 Emitted columns (one row per donor-locus):
     chr, ref_start, ref_allele, hap1_allele, hap2_allele, donor,
     k (= summed hap1 reads), n (= summed total reads), imbalance_significance (any-sig),
     assay
 
-The Stage-2 ASB head reads this table via the hap_counts row source where
+The head reads this table via the hap_counts row source where
     * n = the per-locus depth (privileged precision weight n_eff)
     * imbalance_significance = the binary AS label
     * chr/ref_start are for the leakage split
@@ -24,7 +24,9 @@ _BASECOL = {"A": "cA", "C": "cC", "G": "cG", "T": "cT"}
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hetsnv_tsv", required=True)
-    ap.add_argument("--assay", default="CTCF", help="assay substring filter; 'ALL' keeps all")
+    ap.add_argument("--assay", default="CTCF", help="assay name, matched on a right-hand word boundary; "
+                                                    "'ALL' keeps every assay."
+                         "assay to the aggregation key")
     ap.add_argument("--min_total_reads", type=int, default=1,
                     help="drop aggregated loci with n < this (n=0 has no likelihood)")
     ap.add_argument("--out", default="hap_counts.csv")
@@ -36,7 +38,7 @@ def main():
     usecols = ["chr", "ref_start", "ref_allele", "hap1_allele", "hap2_allele",
                "donor", "tissue", "assay", "cA", "cC", "cG", "cT",
                "imbalance_significance"]
-               
+
     # chunked read + per-chunk assay filter
     n_rows = 0
     keep = []
@@ -50,6 +52,11 @@ def main():
             keep.append(ch)
     df = (pd.concat(keep, ignore_index=True) if keep
           else pd.DataFrame(columns=usecols)).reset_index(drop=True)
+
+    _missing = [c for c in usecols if c not in df.columns]
+    if _missing:
+        raise SystemExit(f"{a.hetsnv_tsv}: missing required column(s) {_missing}. "
+                         f"Found: {sorted(df.columns)}")
 
     def _counts_for(d, allele_col):
         """
@@ -93,7 +100,7 @@ def main():
     n0 = len(agg)
     agg = agg[agg["n"] >= a.min_total_reads].reset_index(drop=True)
     agg["total_reads"] = agg["n"]
-    agg["ref_allele_ratio"] = np.where(agg["n"] > 0, agg["k"] / agg["n"], np.nan)
+    agg["hap1_allele_ratio"] = np.where(agg["n"] > 0, agg["k"] / agg["n"], np.nan)
     agg["n_as_reads"] = agg["n_as_reads"].round().astype(int)
     # weight_depth = depth of the evidence for the label
     # (AS-calling-tissue reads for positives, total pooled reads for negatives)
@@ -109,11 +116,12 @@ def main():
             f"--min_total_reads (currently {a.min_total_reads}).")
 
     cols = ["chr", "ref_start", "ref_allele", "hap1_allele", "hap2_allele",
-            "donor", "k", "n", "total_reads", "ref_allele_ratio", "n_as_reads", "weight_depth",
+            "donor", "k", "n", "total_reads", "hap1_allele_ratio", "n_as_reads", "weight_depth",
             "imbalance_significance", "assay", "n_tissues", "hap1_is_ref"]
     agg[cols].to_csv(a.out, index=False)
 
-    print(f"[in]  {n_rows} rows (assay={a.assay})")
+    print(f"[in]  {n_rows:,} rows read; {len(df):,} matched assay={a.assay!r} "
+          f"({sorted(df['assay'].astype(str).unique())[:4]})")
     print(f"[agg] {n0} donor-loci -> {len(agg)} kept (n>={a.min_total_reads}; dropped {n0-len(agg)})")
     print(f"[pos] imbalance_significant loci: {int(agg.imbalance_significance.sum())} "
           f"({agg.imbalance_significance.mean()*100:.1f}%)")
@@ -128,11 +136,14 @@ def main():
         pt["n"] = (pt["k"] + pt["hap2_count"].round().astype(int)).astype(int)
         pt = pt[pt["n"] >= a.min_total_reads].reset_index(drop=True)
         pt["total_reads"] = pt["n"]
-        pt["ref_allele_ratio"] = np.where(pt["n"] > 0, pt["k"] / pt["n"], np.nan)
-        pt["assay"] = a.assay
+        pt["hap1_allele_ratio"] = np.where(pt["n"] > 0, pt["k"] / pt["n"], np.nan)
+        if a.assay and a.assay.upper() == "ALL":
+            pass # per-row assays already written
+        else:
+            pt["assay"] = a.assay # specific assay: apply the requested name
         pt_cols = ["chr", "ref_start", "ref_allele", "hap1_allele", "hap2_allele",
-                   "donor", "tissue", "assay", "k", "n", "total_reads",
-                   "ref_allele_ratio", "imbalance_significance"]
+                    "donor", "tissue", "assay", "k", "n", "total_reads",
+                   "hap1_allele_ratio", "imbalance_significance"]
         pt[pt_cols].to_csv(a.per_tissue_out, index=False)
         print(f"[per-tissue] wrote {a.per_tissue_out}: {len(pt)} donor-tissue-loci "
               f"({pt['tissue'].nunique()} tissues)")
