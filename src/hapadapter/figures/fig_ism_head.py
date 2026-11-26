@@ -100,10 +100,26 @@ def density_seqs_from_csv(paths, seq_col, label_col, dedup=True):
     import pandas as pd
     frames = []
     for q in paths:
-        d = pd.read_csv(q, usecols=lambda c: c in (seq_col, label_col))
-        for need in (seq_col, label_col):
+        # THE COLUMN NAME FALLS BACK THE SAME WAY THE VALUES DO. This function already
+        # accepts both label vocabularies ("AS"/"nonAS" and 1/0) because the two producers
+        # write different ones -- build_asb_ism_windows writes as_label, build_inputs
+        # renames to label. Accepting only one of the NAMES while accepting both sets of
+        # VALUES meant a Stage-2 build CSV failed on the header despite holding exactly the
+        # labels this panel wants. Tried only when the caller left the default.
+        head = pd.read_csv(q, nrows=0).columns
+        lc = label_col
+        if lc not in head and label_col == "as_label":
+            alt = next((c for c in ("label", "as_label") if c in head), None)
+            if alt:
+                print(f"  [density] {os.path.basename(q)} has no 'as_label'; using {alt!r} "
+                      f"(pass --density_label_col to choose explicitly)")
+                lc = alt
+        d = pd.read_csv(q, usecols=lambda c: c in (seq_col, lc))
+        for need in (seq_col, lc):
             if need not in d.columns:
-                raise SystemExit(f"{q} has no {need!r} column")
+                raise SystemExit(f"{q} has no {need!r} column; present: {list(head)[:12]}")
+        if lc != label_col:
+            d = d.rename(columns={lc: label_col})
         frames.append(d)
     d = pd.concat(frames, ignore_index=True)
     n_raw = len(d)
@@ -182,6 +198,55 @@ def logo_agg(path, ref_profile, W, flank, strand_aware, control="none", seed=0, 
         total, Lw = int(z["onehot"].shape[0]), int(z["onehot"].shape[1])
     return agg, int(used), int(n_flip), total, offs, Lw
 
+
+
+def stamp_letters(fig, mapping, pt=11.0, pad=0.008):
+    """
+    Put bold panel letters in a LEFT-ALIGNED COLUMN, clear of every panel's own labels,
+    WIDENING THE FIGURE'S LEFT MARGIN if there is not already room for them.
+
+    Measured at three points, because each was wrong when guessed. (1) A letter placed at
+    the axes' own corner sits on top of the y tick labels, and a fixed inward nudge lands a
+    different distance from the data on every panel, since panels differ in width and in
+    tick-label width -- so each axes' TIGHT bounding box (tick labels, y-label and title
+    included) is measured in figure coordinates and the leftmost edge over all lettered
+    panels becomes one common x. (2) That x is often negative once the letter's own width
+    is taken off it, which under --exact_size means the letter is simply cut off at the
+    canvas edge rather than being rescued by a tight save -- so the letter is drawn once,
+    measured, and the subplot left margin is widened by exactly the shortfall. (3) The
+    vertical anchor is the tight box TOP, not the axes top, so a letter clears its panel's
+    title instead of landing on it.
+    """
+    fig.canvas.draw()
+    r = fig.canvas.get_renderer()
+    inv = fig.transFigure.inverted()
+    boxes = {L: inv.transform_bbox(ax.get_tightbbox(r))
+             for L, ax in mapping.items() if ax is not None}
+    if not boxes:
+        return
+
+    probe = fig.text(0.5, 0.5, next(iter(boxes)), fontsize=pt, fontweight="bold")
+    fig.canvas.draw()
+    w = inv.transform_bbox(probe.get_window_extent(r)).width
+    probe.remove()
+
+    need = w + 2 * pad
+    left_edge = min(b.x0 for b in boxes.values())
+    if left_edge < need:
+        # Widen rather than overlap or clip. The panels move right by the shortfall; the
+        # letters then sit in margin that belongs to them instead of on the y-labels.
+        shortfall = need - left_edge
+        fig.subplots_adjust(left=min(fig.subplotpars.left + shortfall, 0.45))
+        fig.canvas.draw()
+        boxes = {L: inv.transform_bbox(ax.get_tightbbox(r))
+                 for L, ax in mapping.items() if ax is not None}
+        print(f"  [letters] widened the left margin by {shortfall:.3f} of figure width "
+              f"to fit the panel letters")
+
+    x = max(min(b.x0 for b in boxes.values()) - pad, w + 0.002)
+    for L, bb in boxes.items():
+        fig.text(x, min(bb.y1, 0.998), L, fontsize=pt, fontweight="bold",
+                 ha="right", va="top")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -323,6 +388,23 @@ def main():
                          "2 in of axis, which is too narrow for a 257 bp profile.")
     ap.add_argument("--fontsize", type=float, default=8)
     ap.add_argument("--dpi", type=int, default=200)
+    ap.add_argument("--exact_size", action="store_true",
+                    help="save at --size x --dpi instead of trimming to content")
+    ap.add_argument("--panel_letters", default=None, metavar="A,B,C",
+                    help="comma-separated letters stamped at each section's top-left, in "
+                         "order: saliency, density, logo[, second logo][, reference]")
+    ap.add_argument("--letter_pt", type=float, default=11.0)
+    ap.add_argument("--no_suptitle", action="store_true",
+                    help="omit the figure-level title (a composite usually carries its own)")
+    ap.add_argument("--density_legend", default="above",
+                    choices=["above", "inside", "none"],
+                    help="panel B's AS/non-AS key. 'inside' is matplotlib's upper-right, "
+                         "which lands on the data in a facet this small; 'above' puts one "
+                         "horizontal key over the facet row.")
+    ap.add_argument("--hspace", type=float, default=0.95,
+                    help="vertical gap between panel rows, in units of row height. The old "
+                         "0.62 let panel A's x-label touch panel B's facet titles.")
+    ap.add_argument("--wspace", type=float, default=0.42)
     ap.add_argument("--title", default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--csv_out", default=None)
@@ -368,7 +450,8 @@ def main():
     nrow = (4 if both_logos else 3) + (1 if show_ref else 0)
     heights = [1.05, 0.95, 0.85] + ([0.85] if both_logos else []) + \
               ([0.45] if show_ref else [])
-    gs = fig.add_gridspec(nrow, n_facet, height_ratios=heights, hspace=0.62, wspace=0.42)
+    gs = fig.add_gridspec(nrow, n_facet, height_ratios=heights, hspace=a.hspace,
+                          wspace=a.wspace)
     axA = fig.add_subplot(gs[0, :])
     axB = [fig.add_subplot(gs[1, i]) for i in range(n_facet)]
     axC = fig.add_subplot(gs[2, :])
@@ -424,7 +507,7 @@ def main():
                 ax.axhline(1.0, color="0.6", lw=0.8, ls=":", zorder=1)
             draw_motif_enrichment(
                 ax, groups, [nm], flank, smooth_w=smooth_w, title=nm,
-                fontsize=fs, legend=(i == 0),
+                fontsize=fs, legend=(i == 0 and a.density_legend == "inside"),
                 # y-label on the leftmost facet only: the axes carry DIFFERENT scales, which is
                 # the point of faceting, but repeating the same words beside each one wastes the
                 # width the facets need.
@@ -461,6 +544,18 @@ def main():
                 summary[f"density_{nm}_flank_{glab}"] = round(base, 5)
                 summary[f"density_{nm}_center_over_flank_{glab}"] = (
                     round(centre / base, 4) if base > 0 else float("nan"))
+        if a.density_legend == "above" and axB:
+            # ONE HORIZONTAL KEY OVER THE FACET ROW. Two entries inside a facet this narrow
+            # cover the curves they describe, and repeating the key in each facet spends the
+            # same space four times. Anchored in the first facet's AXES coordinates so it
+            # rides with the row at any --hspace, and frameless because it then sits on
+            # empty canvas rather than over data.
+            hh, ll = axB[0].get_legend_handles_labels()
+            if hh:
+                axB[0].legend(hh, ll, loc="lower left", bbox_to_anchor=(0.0, 1.16),
+                              ncol=len(hh), frameon=False,
+                              fontsize=(8 if fs is None else fs - 1),
+                              handlelength=1.6, columnspacing=1.3, borderaxespad=0.0)
         summary["logo_control"] = a.logo_control
         summary["density_source"] = _dsrc
         summary["density_same_loci_as_logo"] = int(not a.density_csv)
@@ -807,9 +902,29 @@ def main():
         placeholder(axA, "head ISM by outcome", "no --exp_root", fs)
 
 
-    fig.suptitle(a.title or f"HapAdapter head ISM: saliency, cofactor context and "
-                            f"attribution ({who})", fontsize=fs + 3, y=0.995)
-    fig.savefig(a.out, dpi=a.dpi, bbox_inches="tight")
+    if not a.no_suptitle:
+        fig.suptitle(a.title or f"HapAdapter head ISM: saliency, cofactor context and "
+                                f"attribution ({who})", fontsize=fs + 3, y=0.995)
+    if a.panel_letters:
+        # One letter per SECTION, not per axes: panel B is a row of facets sharing a single
+        # letter, so it is labelled at its leftmost facet only.
+        want = [x.strip() for x in a.panel_letters.split(",") if x.strip()]
+        secs = [axA, (axB[0] if axB else None), axC] + \
+               ([axD] if axD is not None else []) + \
+               ([axE] if axE is not None else [])
+        if len(want) > len(secs):
+            raise SystemExit(f"--panel_letters gave {len(want)} letters for {len(secs)} "
+                             f"sections in this configuration ({'+'.join(str(x) for x in want)}). "
+                             f"Sections present: A=saliency, B=density, C=logo"
+                             + (", D=second logo" if axD is not None else "")
+                             + (", E=reference" if axE is not None else "") + ".")
+        stamp_letters(fig, {w: ax for w, ax in zip(want, secs)}, pt=a.letter_pt)
+    # See the composite builder: bbox_inches="tight" makes the saved pixel size depend on
+    # label widths, which is wrong for a tile that must land on a fixed slot.
+    if a.exact_size:
+        fig.savefig(a.out, dpi=a.dpi)
+    else:
+        fig.savefig(a.out, dpi=a.dpi, bbox_inches="tight")
     print(f"[write] {a.out}")
 
     if a.csv_out:

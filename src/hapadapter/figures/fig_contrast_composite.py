@@ -281,7 +281,9 @@ def ell_hist(ax, ell, y, row_label, colors=None, fs=8, clip_q=99.5, nbins=45,
     ax.legend(loc="best", frameon=True, framealpha=0.82, edgecolor="none",
               facecolor="white", fontsize=fs - 1)
     ax.tick_params(labelsize=fs - 1)
-    return au, kept, hi
+    # lo and the drawn array go back too: the caller reports what was clipped, and it can
+    # only do that honestly against the quantity on the axis rather than against `ell`.
+    return au, kept, hi, lo, val
 
 
 def dist_hist(ax, val, y, xlabel, title, colors=None, logx=False, vline=None, fs=8,
@@ -408,6 +410,28 @@ def load_row(path):
     return d, y, np.asarray(tnorm, float), np.asarray(hnorm, float), np.asarray(ell, float)
 
 
+# COLUMN NAMES, IN DRAW ORDER. The pair of words before "cumulative"/"binned" is the
+# REPRESENTATION (backbone embedding vs the head's projection of it) and the word after is
+# how that one quantity is displayed, so reading across a row walks representation -> head
+# once and reading down a column compares cells on one view.
+COL_TITLES = ("Backbone embedding cumulative distributions",
+              "Backbone embedding binned distributions",
+              "HapAdapter head cumulative distributions",
+              "HapAdapter head binned distributions")
+
+# ONE AXIS NAME FOR ALL FOUR COLUMNS. Columns 1-2 draw ||h1 - h2|| and columns 3-4 draw
+# ||P(h1) - P(h2)||; both are divided by the non-AS median, so 1.0 means "a typical non-AS
+# locus" on every panel and the axes are directly comparable. The norms themselves are no
+# longer on the axis, so a caption defining the quantity is what carries that distinction.
+COL_XLABEL = "Haplotype dissimilarity over nonAS median"
+
+# ...AND THE UNNORMALISED NAME, BECAUSE --x_norm DEFAULTS TO "none". Naming the axis
+# "over nonAS median" on a figure built without --x_norm nonas_median would print a claim
+# the data does not support: the values would be raw distances, in units that differ
+# between backbones, under a label asserting they had been divided to a common scale.
+COL_XLABEL_RAW = "Haplotype dissimilarity"
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Four-panel contrast diagnostics, one row per (backbone, assay) npz.")
@@ -425,7 +449,7 @@ def main():
     ap.add_argument("--linx", action="store_true",
                     help="force linear x on both ECDFs (default: log-x when the values span "
                          ">1.5 decades, which is usually the head norm only)")
-    ap.add_argument("--suptitle", default="Separation of haplotypes in embedding space",
+    ap.add_argument("--suptitle", default="",
                     help="figure-level title. Panel titles name only the QUANTITY and the row "
                          "label at the left names the cell, so everything else -- assay, "
                          "individual, what the dashed lines mean, the medians -- belongs in the "
@@ -500,6 +524,9 @@ def main():
         raise SystemExit(f"--logit_clip_pct has {len(_cp)} values for {len(rows)} --row flags; "
                          f"pass one value or one per row, in --row order")
 
+    # Whether the rows differ by individual decides whether the row labels name it.
+    _multi_individual = len({r[2] for r in rows}) > 1
+
     summary, row_meta = [], []
     for i, (backbone, assay, individual, path) in enumerate(rows):
         d, y, tnorm, hnorm, ell = load_row(path)
@@ -507,6 +534,13 @@ def main():
         # carry a dangling separator and a cross-donor one names the individual on every row.
         label = ", ".join(x for x in (backbone, assay,
                                       pretty_individual(individual, overrides)) if x)
+        # THE ROW LABEL DROPS THE INDIVIDUAL WHEN EVERY ROW SHARES ONE. On a single-individual
+        # figure it is the same string on every row and the caption carries it; on a figure
+        # whose rows DIFFER by individual it is the only thing telling them apart, so it stays.
+        # `label` keeps it either way, so the [clip] lines and --csv_out still name the cell.
+        fig_label = ", ".join(x for x in (
+            backbone, assay,
+            pretty_individual(individual, overrides) if _multi_individual else "") if x)
         aa, bb = resolve_ab(d)
         radius = (-bb / aa) if (aa is not None and bb is not None and -bb / aa > 0) else None
         lx = False if a.linx else "auto"
@@ -517,7 +551,7 @@ def main():
         # more different. Naming this axis a "similarity" would make the same curve read as
         # the opposite finding.
         cols = row_colors(backbone)
-        row_meta.append((label, cols, backbone))
+        row_meta.append((fig_label, cols, backbone))
 
         # SHARED X UNITS ACROSS ROWS. The two backbones' embeddings differ in magnitude by
         # roughly 6x, so raw dissimilarity axes are in different units per row and nothing is
@@ -564,20 +598,42 @@ def main():
             vline=radius,
             vlabel=("decision radius" if radius else "no decision radius: npz has no a/b"),
             fs=a.fontsize)
-        au_e, ell_kept, ell_hi = ell_hist(axes[i][2 + 1], ell, y, label, colors=cols,
+        au_e, ell_kept, ell_hi, ell_lo, ell_drawn = ell_hist(
+            axes[i][2 + 1], ell, y, label, colors=cols,
                                           fs=a.fontsize, clip_q=clip_pcts[i],
                                           mode=a.head_density, dist=hnorm, radius=radius,
                                           xlabel=_xlab_h)
+
+        # NAMED ONCE PER COLUMN, NOT ONCE PER PANEL. Every row drew the same four titles and
+        # the same four x labels, which is sixteen strings saying four things. The column is
+        # named at the top, the axis at the bottom, and the row at the left edge. Set here
+        # rather than at the call sites because three of the four drawing functions fall back
+        # to a default when handed an empty string, so suppression there would mean four
+        # separate `or` chains drifting apart.
+        for _c, _t in enumerate(COL_TITLES):
+            axes[i][_c].set_title(_t if i == 0 else "", fontsize=a.fontsize)
+            axes[i][_c].set_xlabel(
+                (COL_XLABEL if _rel else COL_XLABEL_RAW) if i == len(rows) - 1 else "",
+                fontsize=a.fontsize)
+
         if ell_kept < 1.0:
-            n_cut = int(round((1 - ell_kept) * len(y)))
-            n_cut_as = int(((ell > ell_hi) & (y == 1)).sum())
-            # Name the coordinate actually drawn: in distance mode ell_hi is a DISSIMILARITY,
-            # not a logit, and calling it "head-logit" made 7.1 look like a logit value next to
-            # a radius of 2.06 on the same row.
+            # BOTH TAILS, COUNTED ON THE ARRAY ACTUALLY DRAWN. Two things were wrong here.
+            # The clip is two-sided -- lo at the (100-q)th percentile and hi at the qth -- so
+            # (1 - kept) is the sum of both tails, but it was printed as "beyond it", which
+            # names only the upper one: at clip_q=90 that reported 20% of loci as lying above
+            # a 90th percentile. And the AS subcount tested `ell > ell_hi`, where ell_hi is a
+            # percentile of the DRAWN dissimilarity while ell is the raw logit -- different
+            # quantities in different units, and under --x_norm not even the same scale. It
+            # reported 0 AS in the upper tail of a distribution whose AS class is the one
+            # shifted right. Both tails are now counted on `drawn`, the array on the axis.
+            drawn = np.asarray(ell_drawn, dtype=float)
+            hi_m, lo_m = drawn > ell_hi, drawn < ell_lo
+            n_hi, n_lo = int(hi_m.sum()), int(lo_m.sum())
+            n_hi_as, n_lo_as = int((hi_m & (y == 1)).sum()), int((lo_m & (y == 1)).sum())
             _coord = ("head-separation" if a.head_density == "distance" else "head-logit")
-            print(f"  [clip] {label}: {_coord} axis ends at {ell_hi:.3g}; "
-                  f"{n_cut} of {len(y)} loci beyond it ({1 - ell_kept:.1%}), "
-                  f"{n_cut_as} of them AS")
+            print(f"  [clip] {label}: {_coord} axis spans {ell_lo:.3g} to {ell_hi:.3g}; "
+                  f"{n_hi + n_lo} of {len(y)} loci outside it ({1 - ell_kept:.1%}) -- "
+                  f"{n_hi} above ({n_hi_as} AS), {n_lo} below ({n_lo_as} AS)")
         med_gain = median_gain(hnorm, tnorm, y)
 
         summary.append(dict(backbone=backbone, assay=assay, individual=individual,
@@ -605,9 +661,10 @@ def main():
               f"trunk {au_t:.3f} head {au_h:.3f} ell {au_e:.3f} | "
               f"radius {('%.3g' % radius) if radius else 'n/a':>7} | gain {med_gain:+.3f}")
 
-    fig.suptitle(a.suptitle, fontsize=a.fontsize + 4, y=0.995)
+    if a.suptitle:
+        fig.suptitle(a.suptitle, fontsize=a.fontsize + 4, y=0.995)
     # Leave a strip on the left for the row labels and one at the bottom for the backbone key.
-    fig.tight_layout(rect=(0.035, 0.030, 1.0, 0.975))
+    fig.tight_layout(rect=(0.035, 0.030, 1.0, 0.975 if a.suptitle else 1.0))
 
     # ROW LABELS AFTER LAYOUT, NOT BEFORE. The row's vertical centre is only known once
     # tight_layout has placed the axes; positioning these from nominal coordinates puts them

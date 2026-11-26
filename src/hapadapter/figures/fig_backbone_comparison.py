@@ -41,7 +41,7 @@ import pandas as pd
 
 NAME = {"ctcf": "CTCF", "ep300": "EP300", "polr2a": "POLR2A",
         "polr2aphosphos5": "POLR2AphosphoS5", "h3k4me3": "H3K4me3",
-        "h3k4me1": "H3K4me1", "h3k27ac": "H3K27ac", "atac": "ATAC",
+        "h3k4me1": "H3K4me1", "h3k27ac": "H3K27ac", "atac": "ATAC-seq",
         "h3k36me3": "H3K36me3", "h3k27me3": "H3K27me3", "h3k9me3": "H3K9me3"}
 
 #: Panel order is by REGULATORY REGIME -- TF, promoter, enhancer mark, accessibility,
@@ -102,6 +102,7 @@ def style(base=8.0):
 
 
 def build(d, metric="auroc_plain", title=None, size=6.8, bar_width=0.62, ncols=3,
+          legend_slot="last",
           keep=None):
     bars = d[d.backbone != "control"]
     # ORDER always sets the SEQUENCE; `keep` only subsets it. Passing a reordered --assays
@@ -164,10 +165,31 @@ def build(d, metric="auroc_plain", title=None, size=6.8, bar_width=0.62, ncols=3
                           hspace=0.17, wspace=0.09)
     axes = [[fig.add_subplot(gs[r, c]) for c in range(ncols)] for r in range(rows_n)]
     flat = [x for row in axes for x in row]
-    for ax in flat[len(assays):]:          # trailing slots in an incompletely filled grid
-        ax.set_visible(False)
 
-    for ax, a in zip(flat, assays):
+    # WHICH SLOT THE LEGEND TAKES, AND THEREFORE WHICH SLOTS THE PANELS GET. The default is
+    # the last slot, so panels fill the grid in order and the key lands bottom-right.
+    # "first_row_end" instead reserves the end of the FIRST row, which turns 9 panels at
+    # ncols=5 from 5+4 with the key below into 4+5 with the key beside the top row. The
+    # panels have to skip that slot rather than flow through it, or the assay order would
+    # silently shift by one against every previous draft.
+    legend_idx = None
+    if n_free > 0:
+        legend_idx = (ncols - 1) if legend_slot == "first_row_end" else len(flat) - 1
+    elif legend_slot == "first_row_end":
+        print(f"[legend] --legend_slot first_row_end needs a free grid slot, but "
+              f"{len(assays)} assays fill {rows_n}x{ncols} exactly. Using the reserved "
+              f"strip below the panels; --ncols {ncols + 1} would free one.")
+    panel_ix = [i for i in range(len(flat)) if i != legend_idx]
+    if len(assays) > len(panel_ix):
+        raise SystemExit(f"{len(assays)} assays do not fit {rows_n}x{ncols} with the legend "
+                         f"in a slot; raise --ncols or use the default --legend_slot last.")
+    used = set(panel_ix[:len(assays)])
+    for i, ax in enumerate(flat):
+        if i not in used and i != legend_idx:
+            ax.set_visible(False)
+
+    for i, a in zip(panel_ix, assays):
+        ax = flat[i]
         sub = bars[bars.assay == a]
         for x, (bb, rg, col, lab) in zip(XPOS, BARS):
             r = sub[(sub.backbone == bb) & (sub.rung == rg)]
@@ -191,10 +213,17 @@ def build(d, metric="auroc_plain", title=None, size=6.8, bar_width=0.62, ncols=3
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
 
-    for row in axes:
-        row[0].set_ylabel("AUROC", labelpad=3)
-        for ax in row[1:]:
-            ax.tick_params(labelleft=False)
+    # The y-label goes on the LEFTMOST VISIBLE PANEL of each row, not on column 0 blindly:
+    # with the legend in the first row's last slot every row still starts at column 0, but a
+    # future arrangement that reserves a left-hand slot would otherwise label a blank axes
+    # and leave the first real panel without one.
+    for r, row in enumerate(axes):
+        vis = [c for c, ax in enumerate(row) if r * ncols + c in used]
+        if not vis:
+            continue
+        row[vis[0]].set_ylabel("AUROC", labelpad=3)
+        for c in vis[1:]:
+            row[c].tick_params(labelleft=False)
 
     if title:
         fig.suptitle(title, y=0.985, fontsize=9)
@@ -214,8 +243,8 @@ def build(d, metric="auroc_plain", title=None, size=6.8, bar_width=0.62, ncols=3
     # In-grid: the two groups stack in the LAST free slot, which is the bottom-right corner.
     # Stacked rather than side by side because one slot is a panel's width, not the figure's.
     host_ax = None
-    if n_free > 0:
-        host_ax = flat[-1]
+    if legend_idx is not None:
+        host_ax = flat[legend_idx]
         host_ax.set_visible(True)
         host_ax.axis("off")
     # THE SECOND GROUP IS PLACED FROM THE FIRST'S MEASURED HEIGHT, not at a guessed fraction of
@@ -274,6 +303,12 @@ def main():
     ap.add_argument("--ncols", type=int, default=3,
                     help="panel columns. Rows follow from the assay count, and trailing empty "
                          "slots are hidden. 6 assays at the default is the original 2x3.")
+    ap.add_argument("--legend_slot", default="last", choices=["last", "first_row_end"],
+                    help="which free grid slot holds the key. 'last' is the bottom-right "
+                         "corner (panels fill the grid in order). 'first_row_end' reserves "
+                         "the end of the top row instead, so 9 assays at --ncols 5 read as "
+                         "4 panels + key, then 5 panels. Needs a free slot; with none the "
+                         "key falls back to the strip below the panels.")
     ap.add_argument("--bar_width", type=float, default=0.62)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
@@ -291,7 +326,7 @@ def main():
 
     style()
     fig = build(d, metric=a.metric, title=a.title, size=a.size, bar_width=a.bar_width,
-                ncols=a.ncols,
+                ncols=a.ncols, legend_slot=a.legend_slot,
                 keep=(a.assays.split(",") if a.assays else None))
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     # No bbox_inches="tight": it would crop to content and break the square aspect.

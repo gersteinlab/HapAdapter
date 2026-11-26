@@ -419,6 +419,10 @@ def main():
     ap.add_argument("--donors", default="ENC-002", help="comma-separated (--from_eval_results)")
     ap.add_argument("--run_subdir", default="clf_s20_seed20")
     ap.add_argument("--metric_key", default=None)
+    ap.add_argument("--assay_label", action="append", default=[], metavar="RAW=DISPLAY",
+                    help="repeatable display override for an x tick, e.g. 'ATAC=ATAC-seq'. "
+                         "Case-insensitive on the raw assay name; the assay string used to "
+                         "find runs and written to --csv_out is unchanged.")
     ap.add_argument("--individual_label", action="append", default=[], metavar="RAW=DISPLAY")
     ap.add_argument("--show_mean", action="store_true",
                     help="draw the mean-across-individuals arrow ALONGSIDE the per-individual "
@@ -455,12 +459,23 @@ def main():
     ap.add_argument("--ymax", type=float, default=None)
     ap.add_argument("--size", type=float, nargs=2, default=[7.2, 4.2], metavar=("W", "H"))
     ap.add_argument("--fontsize", type=float, default=8)
+    ap.add_argument("--left_margin_in", type=float, default=None,
+                    help="force the plot area to start this many inches from the left edge "
+                         "instead of wherever tight_layout puts it. Pass the SAME value to "
+                         "every panel of a composite so their axes align.")
+    ap.add_argument("--title_fontsize", type=float, default=None,
+                    help="title size in points; defaults to --fontsize + 2. Lower it when "
+                         "this figure is a narrow panel of a composite.")
     ap.add_argument("--xtick_rotation", type=float, default=30,
                     help="assay label rotation. A narrower figure needs a steeper angle: the "
                          "longest assay name sets how close the ticks can sit before they "
                          "collide, not the arrows.")
     ap.add_argument("--title", default="")
     ap.add_argument("--dpi", type=int, default=300)
+    ap.add_argument("--exact_size", action="store_true",
+                    help="save at exactly --size x --dpi pixels instead of trimming to the "
+                         "drawn content. Use when this figure is a panel of a composite, so "
+                         "every panel keeps the same text scale.")
     ap.add_argument("--csv_out", default=None,
                     help="write the resolved per-cell rows (reference, personal, gain)")
     ap.add_argument("--out", required=True)
@@ -571,6 +586,18 @@ def main():
 
     order = assays_cli or list(dict.fromkeys(d["assay"]))
     order = [x for x in order if x in set(pairs["assay"])]
+    # --assays SELECTS THE DATA, not just the tick order. Filtering only `order` left the
+    # excluded rows in `pairs`, where they still set the y-limits below, were counted in the
+    # summary line and were written to --csv_out -- so an assay deliberately dropped from a
+    # panel could still stretch its axis and be reported as one of its cells.
+    _drop = sorted(set(pairs["assay"]) - set(order))
+    if _drop:
+        print(f"[assays] excluding {_drop}: not in --assays. "
+              f"{len(order)} assay(s) drawn.")
+        pairs = pairs[pairs["assay"].isin(order)].reset_index(drop=True)
+        if pairs.empty:
+            raise SystemExit(f"--assays {assays_cli} selected nothing; the input has "
+                             f"{sorted(set(d['assay']))}.")
     indivs = [x for x in dict.fromkeys(pairs["individual"]) if x != MEAN_LABEL]
     if MEAN_LABEL in set(pairs["individual"]):
         indivs.append(MEAN_LABEL)        # always rightmost in the group
@@ -645,8 +672,22 @@ def main():
             ax.text(x0, r[arm_from] - 0.006, f"{r[arm_from]:.03f}", ha="center",
                     va="top", fontsize=a.fontsize - 2, color="0.35", zorder=4)
 
+    # DISPLAY NAMES ARE AN OVERRIDE, NOT A REWRITE OF `order`. The assay string is the join
+    # key into the experiment tree and the CSV, so renaming it there would break the lookup
+    # and silently drop a row; only the tick text changes. Unmapped assays display as-is.
+    _alab = {}
+    for _spec in a.assay_label:
+        if "=" not in _spec:
+            raise SystemExit(f"--assay_label {_spec!r} is not 'RAW=DISPLAY'")
+        _k, _v = _spec.split("=", 1)
+        _alab[_k.strip().upper()] = _v.strip()
+    _unused = sorted(set(_alab) - {x.upper() for x in order})
+    if _unused:
+        print(f"[label] --assay_label named {_unused}, not in this figure's assays "
+              f"({sorted(order)}) -- that mapping had no effect.")
     ax.set_xticks(range(len(order)))
-    ax.set_xticklabels(order, fontsize=a.fontsize, rotation=a.xtick_rotation,
+    ax.set_xticklabels([_alab.get(x.upper(), x) for x in order],
+                       fontsize=a.fontsize, rotation=a.xtick_rotation,
                        ha="right" if a.xtick_rotation else "center")
     # Margin scales with how much width the arrow group actually uses. A half-slot margin is
     # right for a five-arrow group but leaves conspicuous dead space on an --average figure,
@@ -663,7 +704,19 @@ def main():
     if a.title:
         # suptitle rather than set_title: the legend now occupies the space directly above the
         # axes, and a set_title would be laid out underneath it.
-        fig.suptitle(a.title, fontsize=a.fontsize + 2, y=1.0)
+        # A panel of a composite gets a smaller title than a standalone figure: at half
+        # width the default would overflow the canvas, and with --exact_size (no trimming)
+        # the overflow is simply cut off rather than growing the image.
+        _tfs = a.title_fontsize if a.title_fontsize else a.fontsize + 2
+        fig.suptitle(a.title, fontsize=_tfs, y=1.0)
+        if a.exact_size:
+            fig.canvas.draw()
+            _w = fig.get_window_extent().width
+            _tw = fig._suptitle.get_window_extent().width
+            if _tw > _w:
+                print(f"[title] the title is {_tw / _w:.0%} of the figure width at "
+                      f"{_tfs:g} pt and will be CLIPPED; pass --title_fontsize "
+                      f"{_tfs * _w / _tw:.1f} or shorter text.")
 
     overrides = {}
     for spec in a.individual_label:
@@ -696,7 +749,31 @@ def main():
               ncol=legend_ncol, columnspacing=1.4, handletextpad=0.5)
 
     fig.tight_layout()
-    fig.savefig(a.out, dpi=a.dpi, bbox_inches="tight")
+    if a.left_margin_in:
+        # AXES ALIGNMENT ACROSS PANELS OF A COMPOSITE. tight_layout sets the left margin from
+        # how wide THIS panel's tick labels and y-label happen to be, so a panel with 4-char
+        # ticks (0.45) starts its plot area further right than one with 3-char ticks (0.5).
+        # Tiled together their axes do not line up even though the images do. Forcing the
+        # same ABSOLUTE margin in inches on every panel makes the plot areas align; the
+        # fraction differs per panel because the panels differ in width.
+        fig.subplots_adjust(left=a.left_margin_in / float(a.size[0]))
+        fig.canvas.draw()
+        _r = fig.canvas.get_renderer()
+        _items = [t for t in ax.get_yticklabels() if t.get_text()] + [ax.yaxis.label]
+        _x0 = min(t.get_window_extent(_r).x0 for t in _items)
+        if _x0 < 0:
+            print(f"[margin] --left_margin_in {a.left_margin_in} is too small here: the "
+                  f"y-axis labels run {abs(_x0) / a.dpi:.2f} in off the left edge. "
+                  f"Use at least {a.left_margin_in + abs(_x0) / a.dpi + 0.02:.2f}.")
+    # bbox_inches="tight" TRIMS TO THE DRAWN CONTENT, so the saved size depends on how wide
+    # the tick labels and the legend happen to be -- two panels asked for the same figsize
+    # come out at different pixel sizes. That is fine for a standalone figure and wrong for
+    # one panel of a composite, where the tiler would then rescale each panel by a different
+    # factor and their text would no longer match. --exact_size saves at figsize x dpi.
+    if a.exact_size:
+        fig.savefig(a.out, dpi=a.dpi)
+    else:
+        fig.savefig(a.out, dpi=a.dpi, bbox_inches="tight")
     print(f"[write] {a.out}")
 
     n_up = int((pairs["delta"] > 0).sum())

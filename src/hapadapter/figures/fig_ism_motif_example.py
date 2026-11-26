@@ -330,6 +330,55 @@ def pick_window(z, select, jaspar_json=None, threshold=1e-4, central_bp=10,
                      f"motif_at_center:TF | no_motif_at_center:TF, got {select!r}")
 
 
+
+def stamp_letters(fig, mapping, pt=11.0, pad=0.008):
+    """
+    Put bold panel letters in a LEFT-ALIGNED COLUMN, clear of every panel's own labels,
+    WIDENING THE FIGURE'S LEFT MARGIN if there is not already room for them.
+
+    Measured at three points, because each was wrong when guessed. (1) A letter placed at
+    the axes' own corner sits on top of the y tick labels, and a fixed inward nudge lands a
+    different distance from the data on every panel, since panels differ in width and in
+    tick-label width -- so each axes' TIGHT bounding box (tick labels, y-label and title
+    included) is measured in figure coordinates and the leftmost edge over all lettered
+    panels becomes one common x. (2) That x is often negative once the letter's own width
+    is taken off it, which under --exact_size means the letter is simply cut off at the
+    canvas edge rather than being rescued by a tight save -- so the letter is drawn once,
+    measured, and the subplot left margin is widened by exactly the shortfall. (3) The
+    vertical anchor is the tight box TOP, not the axes top, so a letter clears its panel's
+    title instead of landing on it.
+    """
+    fig.canvas.draw()
+    r = fig.canvas.get_renderer()
+    inv = fig.transFigure.inverted()
+    boxes = {L: inv.transform_bbox(ax.get_tightbbox(r))
+             for L, ax in mapping.items() if ax is not None}
+    if not boxes:
+        return
+
+    probe = fig.text(0.5, 0.5, next(iter(boxes)), fontsize=pt, fontweight="bold")
+    fig.canvas.draw()
+    w = inv.transform_bbox(probe.get_window_extent(r)).width
+    probe.remove()
+
+    need = w + 2 * pad
+    left_edge = min(b.x0 for b in boxes.values())
+    if left_edge < need:
+        # Widen rather than overlap or clip. The panels move right by the shortfall; the
+        # letters then sit in margin that belongs to them instead of on the y-labels.
+        shortfall = need - left_edge
+        fig.subplots_adjust(left=min(fig.subplotpars.left + shortfall, 0.45))
+        fig.canvas.draw()
+        boxes = {L: inv.transform_bbox(ax.get_tightbbox(r))
+                 for L, ax in mapping.items() if ax is not None}
+        print(f"  [letters] widened the left margin by {shortfall:.3f} of figure width "
+              f"to fit the panel letters")
+
+    x = max(min(b.x0 for b in boxes.values()) - pad, w + 0.002)
+    for L, bb in boxes.items():
+        fig.text(x, min(bb.y1, 0.998), L, fontsize=pt, fontweight="bold",
+                 ha="right", va="top")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", required=True)
@@ -434,6 +483,14 @@ def main():
     ap.add_argument("--panel_label", default="", help="optional panel letter drawn top-left (e.g. B)")
     ap.add_argument("--title", default="",
                     help="top title line (e.g. 'Ind. 1, ATACseq'); the chr:start-end line is appended")
+    ap.add_argument("--size", type=float, nargs=2, default=None, metavar=("W", "H"),
+                    help="figure size in inches; default derives it from the lane count")
+    ap.add_argument("--dpi", type=int, default=200)
+    ap.add_argument("--exact_size", action="store_true",
+                    help="save at --size x --dpi instead of trimming to content")
+    ap.add_argument("--panel_letter", default=None, metavar="X",
+                    help="stamp this letter at the top-left of the saliency panel")
+    ap.add_argument("--letter_pt", type=float, default=11.0)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     if a.group:                      # repeatable flags -> the same ';'-joined string
@@ -562,7 +619,12 @@ def main():
     h_lanes = float(np.clip(a.row_height * max(len(order), 1), 0.42, 1.7))
     # a class legend needs real width in the right column; a colorbar only needs a strip
     w_right = 0.17 if a.lane_groups else 0.02
-    fig = plt.figure(figsize=(8.8 * (1.0 + w_right - 0.02), 2.1 + 2.0 * h_lanes))
+    # --size OVERRIDES the derived figsize, for use as a panel of a composite where the
+    # slot width is fixed. Left alone, the width follows the legend column and the height
+    # follows the lane count, which is right for a standalone figure and wrong for a tile.
+    _fs = (tuple(a.size) if a.size
+           else (8.8 * (1.0 + w_right - 0.02), 2.1 + 2.0 * h_lanes))
+    fig = plt.figure(figsize=_fs)
     gs = fig.add_gridspec(2, 2, width_ratios=[1.0, w_right], height_ratios=[1.0, h_lanes],
                           hspace=0.18, wspace=0.02)
     axT = fig.add_subplot(gs[0, 0])                          # col 0 -> axT and axH stay x-aligned
@@ -670,7 +732,14 @@ def main():
     if a.panel_label:
         fig.text(0.005, 0.99, a.panel_label, fontsize=16, fontweight="bold", va="top", ha="left")
 
-    fig.savefig(a.out, bbox_inches="tight")
+    if a.panel_letter:
+        stamp_letters(fig, {a.panel_letter: axT}, pt=a.letter_pt)
+    # bbox_inches="tight" trims to content, so the saved pixel size depends on label widths;
+    # a tile has to land on its slot exactly. See the composite builder.
+    if a.exact_size:
+        fig.savefig(a.out, dpi=a.dpi)
+    else:
+        fig.savefig(a.out, bbox_inches="tight")
     print(f"[fig] wrote {a.out}  (lanes colored by "
           + ("the saliency track colour -- colour carries no information here"
              if a.lane_color == "track" else

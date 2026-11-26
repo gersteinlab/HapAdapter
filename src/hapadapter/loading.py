@@ -69,6 +69,8 @@ def _trunk_src(run_config: dict, checkpoint_dir: str) -> str:
             f"{checkpoint_dir}/run_config.json says checkpoint_kind='head_only' but records no "
             f"'init_backbone_from', so the encoder it was fitted on cannot be identified. A "
             f"head-only checkpoint is unusable without it.")
+    if not os.path.isabs(src):
+        src = os.path.normpath(os.path.join(checkpoint_dir, src))
     if not os.path.isdir(src):
         raise ValueError(
             f"{checkpoint_dir} is head-only and names its trunk as\n  {src}\n"
